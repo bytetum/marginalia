@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd user agent: run marginalia-pull.sh at load and every hour. Install: see README "Off-site copy". -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.bytetum.marginalia-pull</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>-c</string><string>"$HOME/.local/bin/marginalia-pull"</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>StandardOutPath</key><string>/tmp/marginalia-pull.log</string>
+  <key>StandardErrorPath</key><string>/tmp/marginalia-pull.log</string>
+</dict>
+</plist>

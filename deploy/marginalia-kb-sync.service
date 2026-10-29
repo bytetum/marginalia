@@ -1,0 +1,10 @@
+# Copy new Marginalia highlights into the kb home store (deploy/marginalia-kb-sync.py). Run by marginalia-kb-sync.timer.
+[Unit]
+Description=Copy Marginalia highlights into kb
+After=marginalia.service
+
+[Service]
+Type=oneshot
+# kb lives in the user profile; systemd user units do not get it on PATH by default.
+Environment=PATH=/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin
+ExecStart=%h/.local/bin/marginalia-kb-sync

@@ -1,0 +1,9 @@
+# systemd user unit, started by marginalia-backup.timer. Install: see README.md ("Backup & restore").
+[Unit]
+Description=Marginalia backup (JSON snapshot plus blobs)
+After=marginalia.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/marginalia-backup
+Nice=10

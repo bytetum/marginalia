@@ -1,0 +1,14 @@
+# systemd user unit. Install: see README.md ("Deploy").
+[Unit]
+Description=Marginalia reading library (REST + MCP)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/share/marginalia
+EnvironmentFile=%h/.config/marginalia/env
+ExecStart=%h/.local/bin/marginalia serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
