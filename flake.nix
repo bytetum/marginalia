@@ -30,11 +30,12 @@
         rustPlatform.buildRustPackage {
           pname = "marginalia";
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+          # Only what the build and tests read, so editing docs or deploy files does not rebuild.
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
               let rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
-              in !(builtins.elem rel [ "deploy" "flake.nix" "flake.lock" "shell.nix" ".github" ])
+              in !(builtins.elem rel [ "deploy" "skills" "README.md" "DESIGN.md" ".env.example" ".gitignore" "flake.nix" "flake.lock" "shell.nix" ".github" ])
                 && pkgs.lib.cleanSourceFilter path type;
           };
           cargoLock.lockFile = ./Cargo.lock;
