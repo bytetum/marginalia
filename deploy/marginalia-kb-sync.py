@@ -3,7 +3,7 @@
 
     Marginalia highlights            (mg-root)
       <article title>  #article      (mg-a-<article id>)  url, reader
-        <highlight text>  #highlight (mg-h-<highlight id>) note, highlighted
+        <highlight text>  #highlight (mg-h-<highlight id>) url, reader, note, highlighted
 
 Only articles with at least one highlight are copied. Node ids are derived from Marginalia ids, so a run only adds what
 is missing: it never duplicates, edits or deletes, and nodes moved, edited or deleted in kb stay as you left them.
@@ -114,7 +114,8 @@ def main() -> int:
         if exists(highlight_node):
             remember(done, highlight_node)
             continue
-        props = ["--prop", f"f.highlighted={h['created_at'][:10]}"]
+        props = ["--prop", f"f.url={article['url']}", "--prop", f"f.reader={base}/#/a/{article['id']}",
+                 "--prop", f"f.highlighted={h['created_at'][:10]}"]
         if h.get("note"):
             props += ["--prop", f"f.note={h['note']}"]
         kb("add", h["text"], "--id", highlight_node, "--parent", article_node, "--tag", "highlight", *props)

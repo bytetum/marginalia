@@ -247,7 +247,7 @@ cat ~/Backups/marginalia/.last-pull   # time of the last successful pull; log in
 
 `deploy/marginalia-kb-sync.py` copies highlights into the kb home store every 15 minutes
 (`marginalia-kb-sync.timer`): a `Marginalia highlights` node, one `#article` node per highlighted article (fields `url`,
-`reader`), and one `#highlight` node per highlight under it (fields `note`, `highlighted`). Node ids come from Marginalia
+`reader`), and one `#highlight` node per highlight under it (fields `url`, `reader`, `note`, `highlighted`). Node ids come from Marginalia
 ids (`mg-a-…`, `mg-h-…`), so it only ever adds: never duplicates, edits or deletes. Copied ids are remembered in
 `~/.local/state/marginalia/kb-synced.txt`; anything you move, edit or delete in kb stays that way.
 
