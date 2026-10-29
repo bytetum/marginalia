@@ -86,7 +86,7 @@ closes lingering MCP event streams after 5 seconds.
 ## REST
 
 JSON in and out. With a token set, send `Authorization: Bearer <token>` on everything except `GET /health`, the web
-page files (`/`, `/app.js`, `/app.css`; they hold no data) and `GET /save` (see Quick save).
+page files (`/`, `/app.js`, `/app.css`, `/vendor/mermaid.min.js`; they hold no data) and `GET /save` (see Quick save).
 Errors are `{"error": "..."}`: 400 invalid input, 401 auth, 404 not found, 502 upstream (fetch or LLM), 503 no LLM, 500 storage.
 
 | Method and path | Body / query | Result |
@@ -121,7 +121,10 @@ PWA install: use it as a normal page (on a phone, "Add to Home Screen" gives a p
 
 Markdown is rendered on the server (`src/render.rs`, `pulldown-cmark`): raw HTML in an article is shown as text, links
 open in a new tab with `rel="noopener noreferrer"`, and links that are not http, https or mailto lose their `href`.
-The page also ships a Content-Security-Policy that allows only its own script and style.
+```mermaid blocks are drawn as diagrams: the vendored Mermaid (`web/vendor/`, served at `/vendor/mermaid.min.js`, works
+offline) is loaded only when an article or synthesis has one, and a diagram that does not parse stays a code block with an error note.
+The page also ships a Content-Security-Policy: scripts only from the page's own origin (no inline script, no eval), styles from
+its own origin plus inline styles, which Mermaid's SVG needs.
 
 ## Quick save
 

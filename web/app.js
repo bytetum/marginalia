@@ -173,12 +173,75 @@
     await loadPage();
   }
 
+  // ---------- diagrams ----------
+
+  // ```mermaid fences come out of the server as <pre><code class="language-mermaid">. Mermaid (vendored, ~3 MB) is
+  // loaded only when a page has such a block, once per page load.
+  const DIAGRAM = 'pre > code.language-mermaid';
+  const NOT_TEXT = '.mermaid-diagram, .diagram-error'; // never searched for highlights
+  let mermaidLoad = null;
+  let diagramId = 0;
+
+  function loadMermaid() {
+    if (!mermaidLoad) {
+      mermaidLoad = new Promise((resolve, reject) => {
+        if (window.mermaid) return resolve(window.mermaid);
+        const script = document.createElement('script');
+        script.src = '/vendor/mermaid.min.js';
+        script.onload = () => (window.mermaid ? resolve(window.mermaid) : reject(new Error('mermaid did not start')));
+        script.onerror = () => reject(new Error('mermaid could not be loaded'));
+        document.head.append(script);
+      });
+      mermaidLoad.catch(() => {
+        mermaidLoad = null; // the next page may try again
+        for (const s of document.querySelectorAll('script[src="/vendor/mermaid.min.js"]')) s.remove();
+      });
+    }
+    return mermaidLoad;
+  }
+
+  function diagramError(pre, e) {
+    const first = String((e && e.message) || e || 'unknown error').split('\n').find((l) => l.trim()) || 'unknown error';
+    pre.after(h('p', { class: 'meta diagram-error' }, 'Diagram error: ' + first.trim().replace(/:$/, '').slice(0, 200)));
+  }
+
+  // Replaces each mermaid code block under `root` with its SVG. A block that does not parse, or a script that does not
+  // load, leaves the code block in place with a short note below it. Never throws.
+  async function renderDiagrams(root) {
+    const blocks = [...root.querySelectorAll(DIAGRAM)].map((code) => code.parentElement);
+    if (!blocks.length) return;
+    let mermaid;
+    try {
+      mermaid = await loadMermaid();
+      const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default', suppressErrorRendering: true });
+    } catch (e) {
+      for (const pre of blocks) diagramError(pre, e);
+      return;
+    }
+    for (const pre of blocks) {
+      const id = 'mermaid-' + ++diagramId;
+      try {
+        const { svg } = await mermaid.render(id, pre.textContent);
+        const box = h('div', { class: 'mermaid-diagram' });
+        box.innerHTML = svg; // produced by Mermaid in strict mode from this page's own text
+        pre.replaceWith(box);
+      } catch (e) {
+        // A failed render can leave its scratch element behind in <body>.
+        for (const stray of document.querySelectorAll('#d' + id + ', #' + id)) if (!root.contains(stray)) stray.remove();
+        diagramError(pre, e);
+      }
+    }
+  }
+
   // ---------- reader ----------
 
   // Text of `root` with whitespace collapsed, plus for each character where it came from. A virtual space is
   // inserted between text nodes of different blocks, because a selection spanning paragraphs has a newline there.
   function indexText(root) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement && n.parentElement.closest(NOT_TEXT) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
     const chars = [];
     const map = [];
     let lastSpace = true;
@@ -253,6 +316,8 @@
     const body = h('div', { class: 'article' });
     body.innerHTML = html; // sanitised on the server (src/render.rs)
     dropRepeatedTitle(body, article.title);
+    await renderDiagrams(body); // before marking, so highlights see the final text
+    if (my !== nav) return;
     const link = webUrl(article.url);
     const meta = h('p', { class: 'meta' },
       link ? h('a', { href: link, target: '_blank', rel: 'noopener noreferrer' }, host(link) || 'Original') : article.url,
@@ -374,6 +439,8 @@
     const body = h('div', { class: 'article' });
     body.innerHTML = html; // sanitised on the server
     dropRepeatedTitle(body, s.title);
+    await renderDiagrams(body);
+    if (my !== nav) return;
     show(
       h('p', null, h('a', { href: '#/s' }, '← Syntheses')),
       h('h1', null, s.title),

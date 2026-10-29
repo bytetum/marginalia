@@ -134,6 +134,12 @@ mod tests {
     }
 
     #[test]
+    fn mermaid_fences_keep_the_language_class() {
+        let out = markdown_to_html("```mermaid\nflowchart LR\n  A --> B\n```");
+        assert!(out.contains("<pre><code class=\"language-mermaid\">flowchart LR\n  A --&gt; B\n</code></pre>"), "{out}");
+    }
+
+    #[test]
     fn escape_html_covers_attribute_characters() {
         assert_eq!(escape_html(r#"<a href="x">&'"#), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
     }

@@ -122,6 +122,10 @@ ul.list .snippet { display: block; font-size: .9rem; margin-top: .15rem; }
 .article th, .article td { border: 1px solid var(--line); padding: .25rem .5rem; }
 .article h1, .article h2, .article h3 { font-family: var(--sans); line-height: 1.25; }
 
+.mermaid-diagram { overflow-x: auto; margin: 1rem 0; text-align: center; }
+.mermaid-diagram svg { display: inline-block; max-width: 100%; height: auto; }
+.diagram-error { margin-top: -.5rem; color: var(--muted); font-family: var(--sans); }
+
 mark { background: var(--mark); color: inherit; border-radius: 2px; }
 
 ul.highlights { list-style: none; padding: 0; margin: 0; }

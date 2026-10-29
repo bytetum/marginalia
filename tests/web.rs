@@ -58,6 +58,12 @@ async fn static_files_are_public_with_the_right_content_types() {
     let (res, _) = get(&router, "/", None).await;
     assert!(header_of(&res, header::CONTENT_SECURITY_POLICY).contains("script-src 'self'"));
 
+    // The script origin stays locked down: no inline script, no eval. Styles may be inline (Mermaid's SVG needs it).
+    let csp = header_of(&res, header::CONTENT_SECURITY_POLICY);
+    let script_src = csp.split(';').map(str::trim).find(|d| d.starts_with("script-src")).expect("script-src directive");
+    assert_eq!(script_src, "script-src 'self'", "{csp}");
+    assert!(!csp.contains("unsafe-eval"), "{csp}");
+
     // The files hold no data, but the API still does.
     assert_eq!(get(&router, "/articles", None).await.0.status(), StatusCode::UNAUTHORIZED);
 }
@@ -194,4 +200,42 @@ async fn save_link_without_a_configured_token_is_open_but_still_validates() {
     let router = api::router(app, None);
     assert_eq!(get(&router, "/save", None).await.0.status(), StatusCode::BAD_REQUEST);
     assert_eq!(get(&router, "/save?url=ftp%3A%2F%2Fx.test", None).await.0.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn vendored_mermaid_is_public_cached_and_keeps_the_csp() {
+    let (app, _dir) = app();
+    let router = api::router(app, Some(TOKEN.into()));
+    let req = Request::builder().method("GET").uri("/vendor/mermaid.min.js").body(Body::empty()).expect("request");
+    let res = router.clone().oneshot(req).await.expect("response");
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header_of(&res, header::CONTENT_TYPE), "text/javascript; charset=utf-8");
+    assert_eq!(header_of(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert!(header_of(&res, header::CACHE_CONTROL).contains("max-age=31536000"));
+    let csp = header_of(&res, header::CONTENT_SECURITY_POLICY).to_owned();
+    assert!(csp.contains("script-src 'self';"), "{csp}");
+    assert!(!csp.contains("script-src 'self' 'unsafe"), "{csp}");
+    let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    assert!(bytes.len() > 100_000, "mermaid should be a large script, got {} bytes", bytes.len());
+    assert!(String::from_utf8_lossy(&bytes).contains("mermaid"));
+}
+
+#[tokio::test]
+async fn mermaid_fences_render_with_the_class_the_page_script_looks_for() {
+    let (app, _dir) = app();
+    let article = app
+        .save_markdown(
+            "https://example.com/diagram",
+            "Diagram",
+            "Intro.\n\n```mermaid\nflowchart TD\n  A[Start] --> B{Is <it> ok?}\n```\n\n```rust\nfn main() {}\n```\n",
+        )
+        .await
+        .expect("save");
+    let router = api::router(app, Some(TOKEN.into()));
+    let (res, html) = get(&router, &format!("/articles/{}/html", article.id), Some(TOKEN)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // `pre > code.language-mermaid` is the selector in web/app.js.
+    assert!(html.contains("<pre><code class=\"language-mermaid\">flowchart TD\n  A[Start] --&gt; B{Is &lt;it&gt; ok?}\n</code></pre>"), "{html}");
+    assert!(html.contains("<pre><code class=\"language-rust\">"), "{html}");
+    assert!(include_str!("../web/app.js").contains("pre > code.language-mermaid"));
 }

@@ -17,7 +17,7 @@ Easy access (REST + our MCP) · Synthesis products served to others.
 | Search | Keyword only (SurrealDB full-text, BM25); vectors later behind the same `search()` |
 | MCP scope | Read + add: read/search articles, highlights, syntheses; save_url; add_highlight; save_synthesis. No deletes |
 | Built-in runs via MCP | Yes: `analyse_article` and `write_brief` tools call the built-in loop |
-| Web page | Static `web/` files embedded in the binary, served at `/` without auth; data via the REST API with a bearer token in localStorage. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html` |
+| Web page | Static `web/` files embedded in the binary, served at `/` without auth; data via the REST API with a bearer token in localStorage. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html`. ```mermaid fences are drawn client-side by a vendored `web/vendor/mermaid.min.js`, loaded lazily |
 | Quick save | `GET /save?url=&token=` (token in the query only on this route, constant-time check) saves then 303s to `/#/a/<id>`; iOS Shortcut / Android use `POST /articles` |
 | Deploy | systemd user service `marginalia` (linger already on), bound to Tailscale `100.103.153.13`, token in an env file |
 
