@@ -26,11 +26,13 @@ const DEFAULT_SYNTHESIS_LIMIT: u32 = 20;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
+/// Mermaid, vendored (see `web/vendor/README.md`) so diagrams are drawn offline.
+const MERMAID_JS: &[u8] = include_bytes!("../web/vendor/mermaid.min.js");
 
 /// Paths that never need the bearer token: the health check, the static web page (no data in it), and
 /// `/save`, which checks its own `?token=` because bookmarklets and share sheets cannot set headers.
 fn is_public(path: &str) -> bool {
-    matches!(path, "/health" | "/" | "/app.js" | "/app.css" | "/save")
+    matches!(path, "/health" | "/" | "/app.js" | "/app.css" | "/vendor/mermaid.min.js" | "/save")
 }
 
 #[derive(Clone)]
@@ -50,6 +52,7 @@ pub fn router(app: Arc<App>, token: Option<String>) -> Router {
         .route("/", get(index_page))
         .route("/app.js", get(app_js))
         .route("/app.css", get(app_css))
+        .route("/vendor/mermaid.min.js", get(mermaid_js))
         .route("/health", get(health))
         .route("/articles", get(list_articles).post(save_article))
         .route("/articles/{id}", get(get_article).delete(delete_article))
@@ -330,20 +333,24 @@ async fn export(State(app): Shared) -> ApiResult<LibraryExport> {
 
 // ---------- web page ----------
 
-/// Headers for the static files. The CSP allows only our own script and style, so even a sanitiser bug in the
-/// rendered Markdown could not run script; images may come from anywhere because articles link them.
-fn static_file(content_type: &'static str, body: &'static str) -> Response {
+/// The Content-Security-Policy of the page. Scripts may only come from our own origin: no inline script and no
+/// eval, so even a sanitiser bug in the rendered Markdown could not run script. Styles allow `'unsafe-inline'`
+/// because Mermaid puts a `<style>` element and `style` attributes in the SVG it draws; that is style only.
+/// Images may come from anywhere because articles link them.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                   img-src 'self' data: http: https:; connect-src 'self'; base-uri 'none'; form-action 'self'; \
+                   frame-ancestors 'none'";
+
+/// Headers for the static files. `cache_control` is `no-cache` for the page files and long-lived for the vendored
+/// script, which only changes with the binary.
+fn static_file(content_type: &'static str, cache_control: &'static str, body: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CACHE_CONTROL, cache_control),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: http: https:; \
-                 connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-            ),
+            (header::CONTENT_SECURITY_POLICY, CSP),
         ],
         body,
     )
@@ -351,15 +358,19 @@ fn static_file(content_type: &'static str, body: &'static str) -> Response {
 }
 
 async fn index_page() -> Response {
-    static_file("text/html; charset=utf-8", INDEX_HTML)
+    static_file("text/html; charset=utf-8", "no-cache", INDEX_HTML.as_bytes())
 }
 
 async fn app_js() -> Response {
-    static_file("text/javascript; charset=utf-8", APP_JS)
+    static_file("text/javascript; charset=utf-8", "no-cache", APP_JS.as_bytes())
 }
 
 async fn app_css() -> Response {
-    static_file("text/css; charset=utf-8", APP_CSS)
+    static_file("text/css; charset=utf-8", "no-cache", APP_CSS.as_bytes())
+}
+
+async fn mermaid_js() -> Response {
+    static_file("text/javascript; charset=utf-8", "public, max-age=31536000, immutable", MERMAID_JS)
 }
 
 /// Sanitised HTML for the article body (see `render`). A fragment, meant for `innerHTML`.
