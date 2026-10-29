@@ -94,6 +94,6 @@ code change beyond a rebuild.
 - Errors: `anyhow` only in `main.rs`; library code uses `RepoError` / `AppError`.
 - No `unwrap()` outside tests. No new dependencies without saying why in your report.
 - Tests never touch the network or a real LLM: fake OpenAI-compatible server (axum) and `MemRepo`/Surreal `mem`.
-- NixOS: build and test inside `nix-shell --run '...'` (shell.nix supplies rustup with the pinned toolchain in rust-toolchain.toml, plus gcc/cmake). Never use the system cargo: its rustc cannot compile SurrealDB. Stdin must be `</dev/null`.
+- NixOS: build and test inside `nix-shell --run '...'` (shell.nix supplies rustup with the pinned toolchain in rust-toolchain.toml, plus gcc/cmake). `nix develop` (flake.nix) gives the same toolchain, and `nix build` / `nix flake check` build and test the package. Never use the system cargo: its rustc cannot compile SurrealDB. Stdin must be `</dev/null`.
 - `cat` is aliased to `bat` in this shell; use the Read tool or `command cat`.
 - Reference implementation of extraction and the agent loop: `../marginalia-poc/` (working, tested).
