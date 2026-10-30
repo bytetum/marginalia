@@ -576,14 +576,12 @@ jobs:
       - name: Install the Tauri CLI
         run: npm ci --no-audit --no-fund
         working-directory: app
-      - name: Generate the Xcode project (first run only)
+      - name: Generate the Xcode project from gen/apple/project.yml
         run: |
-          if [ ! -d src-tauri/gen/apple ]; then
-            npx --no-install tauri ios init --ci
-          fi
-          ls src-tauri/gen/apple
+          command -v xcodegen >/dev/null || brew install xcodegen
+          (cd src-tauri/gen/apple && xcodegen generate --spec project.yml)
         working-directory: app
-      - name: Keep the generated project for review (first run only)
+      - name: Keep the regenerated project for review (temporary)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ios-gen-apple
@@ -596,6 +594,8 @@ jobs:
         run: |
           ipa=$(find app/src-tauri/gen/apple/build -name '*.ipa' | head -n1)
           test -n "$ipa"
+          # The Share Extension must be inside the app.
+          unzip -l "$ipa" | grep -F 'ShareExtension.appex/'
           mkdir -p dist
           cp "$ipa" "dist/marginalia-app-$VERSION-ios-unsigned.ipa"
           (cd dist && shasum -a 256 "marginalia-app-$VERSION-ios-unsigned.ipa" >"marginalia-app-$VERSION-ios-unsigned.ipa.sha256")
