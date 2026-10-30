@@ -1,6 +1,9 @@
 # Written by `tauri ios build` / Xcode.
-/assets/
-/Externals/
+# Both directories have to exist for xcodegen; their contents are build output.
+/assets/*
+!/assets/.gitkeep
+/Externals/*
+!/Externals/.gitkeep
 /build/
 *.xcodeproj/xcuserdata/
 *.xcodeproj/project.xcworkspace/xcuserdata/
