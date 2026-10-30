@@ -46,8 +46,8 @@ body {
   padding-right: max(1rem, env(safe-area-inset-right));
 }
 
-.bar { padding-top: .5rem; }
-main { padding-top: .5rem; padding-bottom: 6rem; }
+.bar { padding-top: max(.5rem, env(safe-area-inset-top)); }
+main { padding-top: .5rem; padding-bottom: max(6rem, calc(4rem + env(safe-area-inset-bottom))); }
 
 nav { display: flex; gap: .25rem; align-items: center; }
 nav a, button.link {
@@ -70,7 +70,10 @@ h2 { font-size: 1.15rem; margin: 1.5rem 0 .5rem; }
 .error { color: var(--danger); }
 .status { min-height: 1.5em; margin: .25rem 0 0; }
 
-form.row { display: flex; gap: .5rem; margin: .5rem 0; }
+form.row, div.row { display: flex; gap: .5rem; margin: .5rem 0; }
+form.stack { display: flex; flex-direction: column; gap: .75rem; margin: .75rem 0; }
+form.stack label { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; color: var(--muted); }
+form.stack label input { flex: none; font-size: 1rem; color: var(--fg); }
 input, textarea {
   flex: 1;
   min-width: 0;
@@ -145,3 +148,39 @@ ul.highlights .note { margin-top: .25rem; font-size: .95rem; color: var(--muted)
 #hl-pop input { width: min(60vw, 28ch); }
 #hl-pop form.row { margin: 0; }
 ul.highlights button.link { margin: 0; padding: 0; min-height: 44px; font-size: .9rem; }
+
+/* On a touch screen the popover is a bar docked to the bottom edge of the visual viewport (see placePop in app.js). */
+#hl-pop.dock {
+  left: 0;
+  right: 0;
+  flex-wrap: wrap;
+  justify-content: center;
+  padding: .5rem max(.75rem, env(safe-area-inset-right)) max(.5rem, env(safe-area-inset-bottom)) max(.75rem, env(safe-area-inset-left));
+  border-width: 1px 0 0;
+  border-radius: 14px 14px 0 0;
+}
+#hl-pop.dock form.row { flex: 1 1 0; min-width: 0; }
+#hl-pop.dock input { width: 0; flex: 1 1 0; font-size: 1rem; }
+#hl-pop.dock .error:empty { display: none; }
+#hl-pop, nav, button { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+#hl-pop input { -webkit-user-select: text; user-select: text; }
+
+/* Short confirmation after a link was saved from the share sheet. */
+#toast {
+  position: fixed;
+  z-index: 20;
+  left: 50%;
+  bottom: max(1rem, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  max-width: min(32rem, calc(100vw - 2rem));
+  padding: .75rem 1rem;
+  background: var(--fg);
+  color: var(--bg);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .3);
+}
+#toast.error { background: var(--danger); color: var(--bg); }
+#toast a { color: inherit; font-weight: 600; white-space: nowrap; }
