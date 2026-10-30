@@ -299,3 +299,89 @@ async fn export_needs_the_token_and_returns_the_whole_library() {
     }
     assert_eq!(call(&router, "POST", "/import", Some(TOKEN), Some(export)).await.0, StatusCode::NOT_FOUND);
 }
+
+// ---------- CORS for the Tauri app ----------
+
+async fn with_origin(router: &Router, method: &str, uri: &str, origin: &str, extra: &[(&str, &str)]) -> axum::http::Response<Body> {
+    let mut req = Request::builder().method(method).uri(uri).header(header::ORIGIN, origin);
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    router.clone().oneshot(req.body(Body::empty()).expect("request")).await.expect("response")
+}
+
+fn hv<'a>(res: &'a axum::http::Response<Body>, name: &str) -> Option<&'a str> {
+    res.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn cors_allows_the_app_origins_to_preflight_without_a_token() {
+    let (app, _dir) = app();
+    let router = api::router(app, Some(TOKEN.into()));
+
+    for origin in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"] {
+        for method in ["GET", "POST", "DELETE"] {
+            let res = with_origin(
+                &router,
+                "OPTIONS",
+                "/articles",
+                origin,
+                &[("access-control-request-method", method), ("access-control-request-headers", "authorization,content-type")],
+            )
+            .await;
+            assert!(res.status().is_success(), "{origin} {method}: {}", res.status());
+            assert_eq!(hv(&res, "access-control-allow-origin"), Some(origin));
+            let headers = hv(&res, "access-control-allow-headers").unwrap_or("").to_ascii_lowercase();
+            assert!(headers.contains("authorization") && headers.contains("content-type"), "{headers}");
+            assert!(hv(&res, "access-control-allow-methods").is_some_and(|m| m.contains(method)));
+            // Bearer headers, never cookies: credentials are not allowed.
+            assert_eq!(hv(&res, "access-control-allow-credentials"), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cors_answers_real_requests_for_the_app_including_401() {
+    let (app, _dir) = app();
+    let router = api::router(app, Some(TOKEN.into()));
+    let origin = "tauri://localhost";
+
+    let res = with_origin(&router, "GET", "/health", origin, &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(hv(&res, "access-control-allow-origin"), Some(origin));
+
+    let res = with_origin(&router, "GET", "/articles", origin, &[("authorization", "Bearer s3cret")]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(hv(&res, "access-control-allow-origin"), Some(origin));
+    assert_eq!(hv(&res, "access-control-allow-credentials"), None);
+
+    // A rejected token must still be readable by the app, or it could not tell "wrong token" from "network error".
+    let res = with_origin(&router, "GET", "/articles", origin, &[("authorization", "Bearer nope")]).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(hv(&res, "access-control-allow-origin"), Some(origin));
+}
+
+#[tokio::test]
+async fn cors_refuses_every_other_origin() {
+    let (app, _dir) = app();
+    let router = api::router(app, Some(TOKEN.into()));
+
+    for origin in ["https://evil.example", "http://localhost", "http://localhost:1420", "tauri://localhost.evil.example", "null", "https://marginalia-bytetum.taild98079.ts.net"] {
+        let pre = with_origin(
+            &router,
+            "OPTIONS",
+            "/articles",
+            origin,
+            &[("access-control-request-method", "GET"), ("access-control-request-headers", "authorization")],
+        )
+        .await;
+        assert_eq!(hv(&pre, "access-control-allow-origin"), None, "preflight from {origin}");
+        let res = with_origin(&router, "GET", "/articles", origin, &[("authorization", "Bearer s3cret")]).await;
+        assert_eq!(hv(&res, "access-control-allow-origin"), None, "{origin}");
+    }
+    // No Origin header (curl, the browser page on its own origin): no CORS headers at all.
+    let (_, _) = call(&router, "GET", "/health", None, None).await;
+    let req = Request::builder().method("GET").uri("/health").body(Body::empty()).expect("request");
+    let res = router.clone().oneshot(req).await.expect("response");
+    assert_eq!(hv(&res, "access-control-allow-origin"), None);
+}
