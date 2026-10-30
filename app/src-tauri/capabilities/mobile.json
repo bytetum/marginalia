@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile",
+  "description": "Mobile only: pop the links shared to the app from the share sheet.",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "permissions": ["mobile-sharetarget:allow-pop-intent-queue"]
+}

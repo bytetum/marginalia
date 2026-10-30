@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- marginalia://share?url=... is how the Share Extension hands a link to the app. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.bytetum.marginalia</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>marginalia</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Only HTTPS and exempt crypto; avoids the export-compliance question on every TestFlight upload. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

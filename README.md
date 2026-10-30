@@ -123,6 +123,14 @@ Markdown is rendered on the server (`src/render.rs`, `pulldown-cmark`): raw HTML
 open in a new tab with `rel="noopener noreferrer"`, and links that are not http, https or mailto lose their `href`.
 The page also ships a Content-Security-Policy that allows only its own script and style.
 
+## App (Android, iOS, macOS, Windows, Linux)
+
+`app/` is a Tauri 2 client for the same server: the web page above in a native shell, with the access token in the
+system keychain and "Share to Marginalia" on iOS and Android. It is a separate Cargo package (not part of the server
+build). The page is the files in `web/`, shared, not copied; in the app they call the server at the URL entered on the
+first-run screen. The server allows the app's origins (`tauri://localhost`, `http(s)://tauri.localhost`) through CORS and
+nobody else's. Releases carry the builds; how they are made, signed and installed is in `app/README.md`.
+
 ## Quick save
 
 `GET /save?url=<url>&token=<token>` saves the page and redirects (303) to the reader. It exists because bookmarklets and
@@ -185,6 +193,11 @@ marginalia-<version>/
   README.md
   deploy/            systemd units, backup and kb-sync scripts, env.example
 ```
+
+The same workflow builds the app (`app/`): after the server tarball is published, the `publish-app` job attaches
+`marginalia-app-<version>-android-arm64.apk` (signed with the release key from the repository secrets),
+`-windows-x64-setup.exe`, `-macos-arm64.dmg`, `-linux-x86_64.AppImage`, `-linux-amd64.deb` and an unsigned
+`-ios-unsigned.ipa`, each with a `.sha256` and an attestation, to that same release. Installing them is in `app/README.md`.
 
 Verify a download with its checksum and its build provenance:
 

@@ -1,0 +1,53 @@
+[package]
+name = "marginalia-app"
+# Keep equal to the server's version in ../../Cargo.toml (CI checks it and injects the release version into builds).
+version = "0.1.0"
+description = "Marginalia client app"
+edition = "2024"
+publish = false
+
+# Its own workspace root: this package is not part of the server crate's build (the server's root Cargo.toml has no
+# workspace) and `cargo test` at the repository root never compiles it.
+[workspace]
+
+[lib]
+name = "marginalia_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring-core = "1"
+
+# Share target (mobile only). The plugin keeps the shared intent in a Rust queue the page pops. On iOS the share
+# extension hands the link over as a deep link, so tauri-plugin-deep-link must be registered first.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-mobile-sharetarget = "2"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-deep-link = "2"
+apple-native-keyring-store = { version = "1", features = ["protected"] }
+
+# Token storage. The OS keychain on every platform that has one; see src/secret.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
