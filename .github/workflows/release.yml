@@ -591,12 +591,13 @@ jobs:
           command -v xcodegen >/dev/null || brew install xcodegen
           (cd src-tauri/gen/apple && xcodegen generate --spec project.yml)
         working-directory: app
-      - name: Keep the regenerated project for review (temporary)
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ios-gen-apple
-          path: app/src-tauri/gen/apple
-          retention-days: 3
+      # An app extension must carry the same CFBundleShortVersionString as its app (the CLI only updates the app's).
+      - name: Give the Share Extension the app's version
+        run: |
+          core=${VERSION%%-*}
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $core" src-tauri/gen/apple/ShareExtension/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" src-tauri/gen/apple/ShareExtension/Info.plist
+        working-directory: app
       - name: Build (unsigned)
         run: npx --no-install tauri ios build --ci --no-sign --target aarch64 --config "{\"version\":\"$VERSION\"}"
         working-directory: app

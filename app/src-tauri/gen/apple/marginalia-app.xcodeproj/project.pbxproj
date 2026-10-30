@@ -14,14 +14,41 @@
 		6C97930337FEEA76DE14070E /* assets in Resources */ = {isa = PBXBuildFile; fileRef = FBE80E2BFF20EAD31C707BB2 /* assets */; };
 		6DB86301032D31FA775BFB36 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = E26792BAC603EC455A8B4E42 /* main.mm */; };
 		86CAD414F533172A8A763367 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CAA8DA2EDED861E469B1B419 /* MetalKit.framework */; };
+		9052AA474967B4D77CF19818 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFDFE521D80D0D6162A76814 /* ShareViewController.swift */; };
 		A43EF124E846DE77C9C43255 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BCCAEEDCE0BF8C885025E196 /* Metal.framework */; };
 		C022561538D087D5379CC62C /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 332F16D500D37EAD637081DA /* LaunchScreen.storyboard */; };
 		C7E7D5BB6ECD18DCDDF60996 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BF68D524D49C18BA4C04CE14 /* UIKit.framework */; };
 		CB5845591D3BE96C81D80B1C /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 803D074C822762A313C7ABF4 /* QuartzCore.framework */; };
+		F9D4D10E360BEC244E421913 /* ShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 8BCD53354EC7D9AE189F148C /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		FDC33CA5B27B9E1CC0CAE0BD /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 2F90553864A35ED06E5597D3 /* libapp.a */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		2453F19811809AEE8AE5C72D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AD897F75B0B873993156BBD9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6DB48EFC09D20F09BD720A4C;
+			remoteInfo = ShareExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		490B4D09A32F88731DF43D15 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				F9D4D10E360BEC244E421913 /* ShareExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		1864EAE14C8664FB19F638BC /* .gitkeep */ = {isa = PBXFileReference; path = .gitkeep; sourceTree = "<group>"; };
 		20DBFA238EBD2D8A91202F0C /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		2F90553864A35ED06E5597D3 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		3279CF4CC874D9CE93A6F050 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
@@ -30,11 +57,14 @@
 		76523626895B38D7060E1781 /* marginalia-app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "marginalia-app_iOS.entitlements"; sourceTree = "<group>"; };
 		7940A546DECA2E0CAB902C3E /* secret.rs */ = {isa = PBXFileReference; path = secret.rs; sourceTree = "<group>"; };
 		803D074C822762A313C7ABF4 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		8BCD53354EC7D9AE189F148C /* ShareExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		91679EA27702D4576C94DDAD /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		9719B3F671E397E06D1A4931 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		A357330C04A680BB09958364 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A8B88E0DBB024B7D51F1759C /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		BCCAEEDCE0BF8C885025E196 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		BF68D524D49C18BA4C04CE14 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		BFDFE521D80D0D6162A76814 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		C82D446038EF1D680768ACCA /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		CAA8DA2EDED861E469B1B419 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 		CE3DFDE5FBC2F0B77C50A7AC /* marginalia-app_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "marginalia-app_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -103,6 +133,15 @@
 			path = "marginalia-app_iOS";
 			sourceTree = "<group>";
 		};
+		7C152CFEE19D2747816CA043 /* ShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				91679EA27702D4576C94DDAD /* Info.plist */,
+				BFDFE521D80D0D6162A76814 /* ShareViewController.swift */,
+			);
+			path = ShareExtension;
+			sourceTree = "<group>";
+		};
 		AF9849D98C08334E4EE4ACF0 /* src */ = {
 			isa = PBXGroup;
 			children = (
@@ -122,6 +161,7 @@
 				332F16D500D37EAD637081DA /* LaunchScreen.storyboard */,
 				C806D97A063B7992C7502FAB /* Externals */,
 				3500C6A73DB08DD677846764 /* marginalia-app_iOS */,
+				7C152CFEE19D2747816CA043 /* ShareExtension */,
 				00FE739FAFD11A9E988630A4 /* Sources */,
 				AF9849D98C08334E4EE4ACF0 /* src */,
 				00DF6B65A9BE16CAF552C5E6 /* Frameworks */,
@@ -140,6 +180,7 @@
 		C806D97A063B7992C7502FAB /* Externals */ = {
 			isa = PBXGroup;
 			children = (
+				1864EAE14C8664FB19F638BC /* .gitkeep */,
 			);
 			path = Externals;
 			sourceTree = "<group>";
@@ -148,6 +189,7 @@
 			isa = PBXGroup;
 			children = (
 				CE3DFDE5FBC2F0B77C50A7AC /* marginalia-app_iOS.app */,
+				8BCD53354EC7D9AE189F148C /* ShareExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -155,6 +197,23 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		6DB48EFC09D20F09BD720A4C /* ShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E5C684CF8795F369166D2E42 /* Build configuration list for PBXNativeTarget "ShareExtension" */;
+			buildPhases = (
+				ED0A47D4DCBE0792C8EE453B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ShareExtension;
+			packageProductDependencies = (
+			);
+			productName = ShareExtension;
+			productReference = 8BCD53354EC7D9AE189F148C /* ShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		C9A85D2335575EA0C5DA1D3C /* marginalia-app_iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 235A4BDA8ED996D37F5E3AFC /* Build configuration list for PBXNativeTarget "marginalia-app_iOS" */;
@@ -163,10 +222,12 @@
 				A105846F3D4878B74FF9497F /* Sources */,
 				FC229F34988D6C26498FCAFF /* Resources */,
 				54F1E7BD62CED453F9D170AB /* Frameworks */,
+				490B4D09A32F88731DF43D15 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				510B534291F180F450338721 /* PBXTargetDependency */,
 			);
 			name = "marginalia-app_iOS";
 			packageProductDependencies = (
@@ -201,6 +262,7 @@
 			projectRoot = "";
 			targets = (
 				C9A85D2335575EA0C5DA1D3C /* marginalia-app_iOS */,
+				6DB48EFC09D20F09BD720A4C /* ShareExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -251,7 +313,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		ED0A47D4DCBE0792C8EE453B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9052AA474967B4D77CF19818 /* ShareViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		510B534291F180F450338721 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6DB48EFC09D20F09BD720A4C /* ShareExtension */;
+			targetProxy = 2453F19811809AEE8AE5C72D /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		52B9E2F6BE82BDE96DC3A1DA /* release */ = {
@@ -338,6 +416,26 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		83EEB50A533DB8BE815EEEDB /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_BITCODE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytetum.marginalia.ShareExtension;
+				PRODUCT_NAME = ShareExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = release;
 		};
@@ -435,6 +533,26 @@
 			};
 			name = debug;
 		};
+		DEA17F1DD2A8C64F38D5CD50 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_BITCODE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytetum.marginalia.ShareExtension;
+				PRODUCT_NAME = ShareExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -452,6 +570,15 @@
 			buildConfigurations = (
 				C60117D8023B46D071DEE80A /* debug */,
 				71038784FC995842AC1420BD /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		E5C684CF8795F369166D2E42 /* Build configuration list for PBXNativeTarget "ShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DEA17F1DD2A8C64F38D5CD50 /* debug */,
+				83EEB50A533DB8BE815EEEDB /* release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = debug;

@@ -123,6 +123,14 @@ Markdown is rendered on the server (`src/render.rs`, `pulldown-cmark`): raw HTML
 open in a new tab with `rel="noopener noreferrer"`, and links that are not http, https or mailto lose their `href`.
 The page also ships a Content-Security-Policy that allows only its own script and style.
 
+## App (Android, iOS, macOS, Windows, Linux)
+
+`app/` is a Tauri 2 client for the same server: the web page above in a native shell, with the access token in the
+system keychain and "Share to Marginalia" on iOS and Android. It is a separate Cargo package (not part of the server
+build). The page is the files in `web/`, shared, not copied; in the app they call the server at the URL entered on the
+first-run screen. The server allows the app's origins (`tauri://localhost`, `http(s)://tauri.localhost`) through CORS and
+nobody else's. Releases carry the builds; how they are made, signed and installed is in `app/README.md`.
+
 ## Quick save
 
 `GET /save?url=<url>&token=<token>` saves the page and redirects (303) to the reader. It exists because bookmarklets and
