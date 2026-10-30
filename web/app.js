@@ -127,7 +127,7 @@
   const fmtDate = (iso) => new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 
   function show(...nodes) {
-    $app.replaceChildren(...nodes);
+    $app.replaceChildren(...nodes.filter((n) => n != null && n !== false));
   }
 
   function errorNode(e) {
@@ -578,7 +578,7 @@
   function toast(text, { error, action, ms } = {}) {
     clearTimeout(toastTimer);
     $toast.className = error ? 'error' : '';
-    $toast.replaceChildren(h('span', null, text), action ? h('a', { href: action.href }, action.label) : null);
+    $toast.replaceChildren(...[h('span', null, text), action ? h('a', { href: action.href }, action.label) : null].filter(Boolean));
     $toast.hidden = false;
     toastTimer = setTimeout(() => { $toast.hidden = true; }, ms || (error ? 12000 : 7000));
   }
