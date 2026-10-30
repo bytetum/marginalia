@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Marginalia app icon: an "M" drawn as a path (no font needed) over a highlighter stripe. Colors follow
+       ../../assets/icon.svg in the playground repo (#d97706 amber). -->
+  <rect width="1024" height="1024" rx="224" fill="#d97706"/>
+  <rect x="214" y="650" width="596" height="112" rx="56" fill="#ffe58a"/>
+  <path d="M286 730 V290 L512 560 L738 290 V730" fill="none" stroke="#ffffff" stroke-width="112" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

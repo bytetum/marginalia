@@ -22,8 +22,13 @@ sha2 = "0.11.1"
 surrealdb = { version = "3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs", "net", "sync", "time", "signal"] }
-tower-http = { version = "0.7.1", features = ["trace"] }
+tower-http = { version = "0.7.1", features = ["trace", "cors"] }
 uuid = { version = "1.29.0", features = ["v4"] }
+
+# The static musl release build swaps musl's slow malloc for SurrealDB's own global allocator (jemalloc on x86_64).
+# Scoped to musl so glibc and Nix builds are unchanged.
+[target.'cfg(target_env = "musl")'.dependencies]
+surrealdb = { version = "3.3.4", default-features = false, features = ["kv-surrealkv", "kv-mem", "allocator"] }
 
 [dev-dependencies]
 # in-process MCP client for tests/api.rs

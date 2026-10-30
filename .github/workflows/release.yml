@@ -1,0 +1,667 @@
+name: Release
+
+# Test, build, smoke-test and (on main or a v* tag) publish Marginalia as a static Linux tarball.
+#
+#   pull_request   test, build and smoke only; nothing is ever published.
+#   push to main   publishes a nightly prerelease, v<next patch>-nightly.<UTC commit time YYYYMMDDHHMMSS>.
+#   push of v*     publishes the release named by the tag; a tag with a "-" suffix (v1.0.0-rc.1) is a prerelease.
+#   dispatch       the same as a push of the chosen ref (a branch other than main is a dry run).
+#
+# The Marginalia client app (app/, Tauri 2) is built by the same workflow: Android APK, Windows, macOS and Linux
+# installers, and an unsigned iOS build that proves the iOS target compiles. Pull requests build all of them and
+# publish nothing. When a release is published, the server tarball goes out first (the `publish` job), then the
+# `publish-app` job attaches the app artifacts to that same release, so nothing races and a flaky mobile toolchain can
+# never hold back the server release (re-run the failed jobs and `publish-app` uploads what is missing).
+#
+# Releases are never pruned, on purpose.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref at a time, queued and never cancelled once it may publish, so two publishes of the same ref never
+# race. Pull requests cancel their own superseded runs. (Per ref rather than global, so a newer push to main cannot
+# replace a queued tag run, which would silently drop a release.)
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  # What is this build called, and may it be published?
+  meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish: ${{ steps.meta.outputs.publish }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Work out the version
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cargo_version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if ! [[ $cargo_version =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::cannot read a major.minor.patch version from Cargo.toml (got '$cargo_version')"
+            exit 1
+          fi
+          next_patch="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+
+          # The app is versioned in lockstep with the server: the same version in every manifest.
+          for pair in \
+            "app/src-tauri/Cargo.toml:$(sed -n 's/^version *= *"\(.*\)"/\1/p' app/src-tauri/Cargo.toml | head -n1)" \
+            "app/src-tauri/tauri.conf.json:$(jq -r .version app/src-tauri/tauri.conf.json)" \
+            "app/package.json:$(jq -r .version app/package.json)"; do
+            if [ "${pair#*:}" != "$cargo_version" ]; then
+              echo "::error file=${pair%%:*}::app version '${pair#*:}' differs from the server version $cargo_version in Cargo.toml"
+              exit 1
+            fi
+          done
+          stamp=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d%H%M%S HEAD)
+          # Android versionCode: minutes since the epoch at the commit. It only grows, so every build (nightly or
+          # tagged) installs over the previous one, and it stays far below the 2.1 billion limit.
+          version_code=$(( $(git show -s --format=%ct HEAD) / 60 ))
+
+          kind=dev
+          if [ "$EVENT" != pull_request ]; then
+            case $REF in
+              refs/heads/main) kind=nightly ;;
+              refs/tags/v*) kind=tag ;;
+            esac
+          fi
+
+          prerelease=true
+          case $kind in
+            tag)
+              version=${REF_NAME#v}
+              if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+                echo "::error::tag $REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]"
+                exit 1
+              fi
+              case $version in
+                *-*) ;;
+                *)
+                  prerelease=false
+                  # A stable release says in its binary what Cargo.toml says.
+                  if [ "$version" != "$cargo_version" ]; then
+                    echo "::error::tag $REF_NAME does not match the Cargo.toml version $cargo_version"
+                    exit 1
+                  fi
+                  ;;
+              esac
+              ;;
+            nightly) version="$next_patch-nightly.$stamp" ;;
+            dev) version="$next_patch-dev.$stamp" ;;
+          esac
+          tag=v$version
+
+          publish=false
+          if [ "$kind" != dev ]; then
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::notice::release $tag already exists; not publishing again"
+            else
+              publish=true
+            fi
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+            echo "version_code=$version_code"
+          } >>"$GITHUB_OUTPUT"
+          echo "$kind build $version (tag $tag, prerelease=$prerelease, publish=$publish)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # reqwest (rustls) loads the system CA bundle when a client is built, even if nothing is fetched (flake.nix sets
+      # the same through pkgs.cacert).
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates cmake
+          # With no argument rustup installs what rust-toolchain.toml names.
+          rustup toolchain install --profile minimal
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain and the musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools cmake make
+          rustup toolchain install --profile minimal
+          rustup target add "$TARGET"
+          rustc --version
+          rustup target list --installed
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: musl
+
+      # A fully static binary, so a Nix package can unpack it with no patching. C build scripts (aws-lc, jemalloc)
+      # compile with musl-gcc. musl's own malloc is slow under SurrealDB, so on musl Cargo.toml turns on SurrealDB's
+      # `allocator` feature (jemalloc as the global allocator).
+      - name: Build
+        env:
+          MARGINALIA_VERSION: ${{ env.VERSION }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Check the binary is static and reports the version
+        run: |
+          bin=target/$TARGET/release/marginalia
+          file "$bin"
+          ls -l "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          # ldd exits non-zero on a static binary; what it says is the check.
+          ldd "$bin" 2>&1 | tee ldd.txt || true
+          grep -Eq 'not a dynamic executable|statically linked' ldd.txt
+          [ "$("$bin" --version)" = "marginalia $VERSION" ]
+
+      - name: Package
+        run: |
+          name=marginalia-$VERSION
+          tarball=$name-x86_64-linux.tar.gz
+          mkdir -p "dist/$name/bin"
+          cp "target/$TARGET/release/marginalia" "dist/$name/bin/marginalia"
+          cp README.md "dist/$name/README.md"
+          cp -r deploy "dist/$name/deploy"
+          chmod 0755 "dist/$name/bin/marginalia"
+          cd dist
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct)" \
+            -cf - "$name" | gzip -9n >"$tarball"
+          sha256sum "$tarball" >"$tarball.sha256"
+          tar -tzf "$tarball"
+          sha256sum -c "$tarball.sha256"
+          ls -l "$tarball" "../target/$TARGET/release/marginalia"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: marginalia-${{ env.VERSION }}
+          path: |
+            dist/marginalia-${{ env.VERSION }}-x86_64-linux.tar.gz
+            dist/marginalia-${{ env.VERSION }}-x86_64-linux.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # On a plain runner: nothing from the build job but the tarball (no checkout, no Rust).
+  smoke:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: marginalia-${{ env.VERSION }}
+          path: artifact
+      - name: Unpack
+        run: |
+          cd artifact
+          sha256sum -c "marginalia-$VERSION-x86_64-linux.tar.gz.sha256"
+          tar -xzf "marginalia-$VERSION-x86_64-linux.tar.gz"
+          for f in bin/marginalia README.md deploy/marginalia.service; do
+            test -e "marginalia-$VERSION/$f"
+          done
+      - name: Smoke test
+        run: |
+          bin=$PWD/artifact/marginalia-$VERSION/bin/marginalia
+          [ "$("$bin" --version)" = "marginalia $VERSION" ]
+
+          data=$(mktemp -d)
+          "$bin" --data-dir "$data" serve --bind 127.0.0.1:17999 --token t >"$data/server.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; cat "$data/server.log"' EXIT
+
+          base=http://127.0.0.1:17999
+          for _ in $(seq 1 50); do
+            curl -fs "$base/health" >/dev/null 2>&1 && break
+            kill -0 "$pid"
+            sleep 0.2
+          done
+          health=$(curl -fsS "$base/health")
+          echo "$health"
+          case $health in '{"ok":true'*) ;; *) echo "::error::unexpected /health: $health"; exit 1 ;; esac
+
+          # The token guards everything but /health.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/articles")
+          [ "$code" = 401 ]
+
+          auth=(-H "Authorization: Bearer t")
+          saved=$(curl -fsS "${auth[@]}" -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com/smoke","title":"Smoke test article","markdown":"# Smoke\n\nThe quick brown pelican crosses a quiet harbour."}' \
+            "$base/articles")
+          id=$(jq -r .id <<<"$saved")
+          echo "saved $id"
+          [ -n "$id" ] && [ "$id" != null ]
+
+          hits=$(curl -fsS "${auth[@]}" "$base/search?q=pelican")
+          echo "$hits"
+          [ "$(jq -r --arg id "$id" '[.[] | select(.article_id == $id)] | length' <<<"$hits")" = 1 ]
+
+          kill "$pid"
+          wait "$pid" || true
+          grep -q 'marginalia: stopped' "$data/server.log"
+
+  publish:
+    needs: [meta, test, build, smoke]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release (and, for a nightly, its tag)
+      id-token: write # sign the provenance attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: marginalia-${{ env.VERSION }}
+          path: dist
+      - name: Check the tarball
+        run: |
+          cd dist
+          sha256sum -c "marginalia-$VERSION-x86_64-linux.tar.gz.sha256"
+      # A consumer checks it with `gh attestation verify <tarball> --repo bytetum/marginalia`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: dist/marginalia-${{ env.VERSION }}-x86_64-linux.tar.gz
+      - name: Create the release
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # The meta job looked once; look again, in case a run of another ref got here first.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release $TAG already exists; nothing to publish"
+            exit 0
+          fi
+          subject=$(gh api "repos/$GH_REPO/commits/$SHA" --jq '.commit.message | split("\n")[0]')
+          flags=(--target "$SHA" --title "marginalia $TAG")
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          # A tag push already made the tag; refuse to invent a different one.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            flags+=(--verify-tag)
+          fi
+          {
+            if [ "$PRERELEASE" = true ] && [ "$GITHUB_REF_TYPE" != tag ]; then
+              echo "Nightly build of main at ${SHA:0:7}: $subject"
+            else
+              echo "Built from ${SHA:0:7}: $subject"
+            fi
+            echo
+            echo "Static x86_64 Linux binary (musl, no shared libraries). Unpack the tarball and run \`bin/marginalia\`."
+            echo
+            echo "The Marginalia app (Android APK, Windows, macOS and Linux installers, an unsigned iOS build) is attached as its builds finish."
+            echo
+            echo "Verify:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c marginalia-$VERSION-x86_64-linux.tar.gz.sha256"
+            echo "gh attestation verify marginalia-$VERSION-x86_64-linux.tar.gz --repo $GH_REPO"
+            echo '```'
+          } >notes.md
+          gh release create "$TAG" "${flags[@]}" --notes-file notes.md \
+            "dist/marginalia-$VERSION-x86_64-linux.tar.gz" \
+            "dist/marginalia-$VERSION-x86_64-linux.tar.gz.sha256"
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # The client app (app/, Tauri 2). Same triggers as the server build: pull requests build everything and publish
+  # nothing; `publish-app` below attaches the results to the release the `publish` job made.
+  # ---------------------------------------------------------------------------------------------------------------
+
+  # Windows (NSIS installer), macOS (Apple silicon DMG, ad-hoc signed only) and Linux (AppImage and deb).
+  # NSIS rather than MSI: WiX only accepts versions whose pre-release part is a small number, and our nightlies are
+  # 0.1.1-nightly.<timestamp>.
+  app-desktop:
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux, os: ubuntu-24.04, bundles: "appimage,deb" }
+          - { name: windows, os: windows-latest, bundles: nsis }
+          - { name: macos, os: macos-latest, bundles: dmg }
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the Linux libraries Tauri needs
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev patchelf xdg-utils file
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install --profile minimal
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app/src-tauri
+          key: desktop-${{ matrix.name }}
+      - name: Install the Tauri CLI
+        run: npm ci --no-audit --no-fund
+        working-directory: app
+      - name: Unit tests
+        if: matrix.name == 'linux'
+        run: cargo test --locked
+        working-directory: app/src-tauri
+      - name: Build
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+          BUNDLES: ${{ matrix.bundles }}
+        run: npx --no-install tauri build --ci --bundles "$BUNDLES" --config "{\"version\":\"$VERSION\"}"
+        working-directory: app
+      - name: Collect
+        run: |
+          src=app/src-tauri/target/release/bundle
+          mkdir -p dist
+          case ${{ matrix.name }} in
+            linux)
+              cp "$(ls $src/appimage/*.AppImage)" "dist/marginalia-app-$VERSION-linux-x86_64.AppImage"
+              cp "$(ls $src/deb/*.deb)" "dist/marginalia-app-$VERSION-linux-amd64.deb"
+              ;;
+            windows)
+              cp "$(ls $src/nsis/*-setup.exe)" "dist/marginalia-app-$VERSION-windows-x64-setup.exe"
+              ;;
+            macos)
+              cp "$(ls $src/dmg/*.dmg)" "dist/marginalia-app-$VERSION-macos-arm64.dmg"
+              ;;
+          esac
+          cd dist
+          for f in marginalia-app-*; do
+            if command -v sha256sum >/dev/null; then sha256sum "$f" >"$f.sha256"; else shasum -a 256 "$f" >"$f.sha256"; fi
+          done
+          ls -l
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: marginalia-app-${{ env.VERSION }}-${{ matrix.name }}
+          path: dist/marginalia-app-*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Android APK for arm64 phones, signed with the release key from the repository secrets when they are available
+  # (every push to the repository's own branches, and so every release). A run without the secrets, such as a pull
+  # request from a fork, builds an unsigned APK. The same key has to sign every release for updates to install.
+  app-android:
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      VERSION_CODE: ${{ needs.meta.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          # Gradle's caches are written by the main branch only; pull requests read them.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install the pinned Rust toolchain and the Android target
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add aarch64-linux-android
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app/src-tauri
+          key: android
+      - name: Android SDK and NDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >>"$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >>"$GITHUB_ENV"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" "$ANDROID_NDK_LATEST_HOME" | head -30
+      - name: Install the Tauri CLI
+        run: npm ci --no-audit --no-fund
+        working-directory: app
+      - name: Release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            base64 -d <<<"$KEYSTORE_B64" >"$RUNNER_TEMP/marginalia-release.keystore"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/marginalia-release.keystore" >>"$GITHUB_ENV"
+            echo "::notice::signing with the release keystore"
+          else
+            echo "::warning::no release keystore in this run (a fork?); the APK will be unsigned"
+          fi
+      - name: Build the APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          npx --no-install tauri android build --ci --apk --target aarch64 \
+            --config "{\"version\":\"$VERSION\",\"bundle\":{\"android\":{\"versionCode\":$VERSION_CODE}}}"
+        working-directory: app
+      - name: Collect and check the APK
+        run: |
+          apk=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -n1)
+          test -n "$apk"
+          echo "built $apk"
+          mkdir -p dist
+          out=dist/marginalia-app-$VERSION-android-arm64.apk
+          cp "$apk" "$out"
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ]; then
+            # Verifies the signature and prints the public certificate digest; the same digest on every release.
+            "$apksigner" verify --verbose --print-certs "$out" | grep -E 'Verifies|Verified using|certificate SHA-256'
+          else
+            echo "unsigned build, signature check skipped"
+          fi
+          (cd dist && sha256sum "$(basename "$out")" >"$(basename "$out").sha256")
+          ls -l dist
+
+          # What ended up in the APK: identity, versions, the share intent filter, and the plugin class that Rust calls
+          # through JNI (it must survive R8 with its name).
+          aapt2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
+          "$aapt2" dump badging "$out" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code|^application-label:"
+          "$aapt2" dump badging "$out" | grep -q "package: name='com.bytetum.marginalia' versionCode='$VERSION_CODE' versionName='$VERSION'"
+          "$aapt2" dump xmltree --file AndroidManifest.xml "$out" | grep -q 'android.intent.action.SEND'
+          "$aapt2" dump xmltree --file AndroidManifest.xml "$out" | grep -q 'text/plain'
+          apkanalyzer=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/apkanalyzer | sort -V | tail -n1)
+          "$apkanalyzer" dex packages --defined-only "$out" | grep -E 'mobilesharetarget|Sharetarget' || { echo "::error::share-target plugin classes missing or renamed"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: marginalia-app-${{ env.VERSION }}-android
+          path: dist/marginalia-app-*
+          if-no-files-found: error
+          retention-days: 14
+
+  # iOS: proves the target compiles and archives, with code signing off. The result is an unsigned .ipa that cannot
+  # be installed as it is (a re-signing tool such as Sideloadly or AltStore can sign it with a free Apple ID).
+  # TODO(apple-developer-account): TestFlight needs a paid account. See app/README.md, "iOS", for the signing secrets
+  # and the `tauri ios build --export-method app-store-connect` step that replace --no-sign.
+  app-ios:
+    needs: meta
+    runs-on: macos-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install the pinned Rust toolchain and the iOS target
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add aarch64-apple-ios
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app/src-tauri
+          key: ios
+      - name: Install the Tauri CLI
+        run: npm ci --no-audit --no-fund
+        working-directory: app
+      - name: Generate the Xcode project from gen/apple/project.yml
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          (cd src-tauri/gen/apple && xcodegen generate --spec project.yml)
+        working-directory: app
+      # An app extension must carry the same CFBundleShortVersionString as its app (the CLI only updates the app's).
+      - name: Give the Share Extension the app's version
+        run: |
+          core=${VERSION%%-*}
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $core" src-tauri/gen/apple/ShareExtension/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" src-tauri/gen/apple/ShareExtension/Info.plist
+        working-directory: app
+      - name: Build (unsigned)
+        run: npx --no-install tauri ios build --ci --no-sign --target aarch64 --config "{\"version\":\"$VERSION\"}"
+        working-directory: app
+      - name: Collect
+        run: |
+          ipa=$(find app/src-tauri/gen/apple/build -name '*.ipa' | head -n1)
+          test -n "$ipa"
+          # The Share Extension must be inside the app.
+          unzip -l "$ipa" | grep -F 'ShareExtension.appex/'
+          mkdir -p dist
+          cp "$ipa" "dist/marginalia-app-$VERSION-ios-unsigned.ipa"
+          (cd dist && shasum -a 256 "marginalia-app-$VERSION-ios-unsigned.ipa" >"marginalia-app-$VERSION-ios-unsigned.ipa.sha256")
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: marginalia-app-${{ env.VERSION }}-ios
+          path: dist/marginalia-app-*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Attach the app artifacts to the release `publish` created. Sequential after it, so the two never race. Whatever
+  # app builds succeeded are attached; if any failed, this job fails at the end so it is visible, and re-running the
+  # failed jobs uploads what is missing (--clobber makes the upload repeatable).
+  publish-app:
+    needs: [meta, publish, app-desktop, app-android, app-ios]
+    if: ${{ !cancelled() && needs.meta.outputs.publish == 'true' && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # upload to the release
+      id-token: write # sign the provenance attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: marginalia-app-${{ env.VERSION }}-*
+          merge-multiple: true
+          path: dist
+      - name: Check the files
+        run: |
+          cd dist
+          ls -l
+          for f in *.sha256; do sha256sum -c "$f"; done
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            dist/*.apk
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.ipa
+      - name: Upload to the release
+        run: gh release upload "$TAG" dist/* --clobber
+      - name: Fail if an app build failed
+        env:
+          RESULTS: ${{ needs.app-desktop.result }} ${{ needs.app-android.result }} ${{ needs.app-ios.result }}
+        run: |
+          echo "app job results: $RESULTS"
+          for r in $RESULTS; do
+            [ "$r" = success ] || { echo "::error::an app build did not succeed; its artifact is missing from release $TAG"; exit 1; }
+          done

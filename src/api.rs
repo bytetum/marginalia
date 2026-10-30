@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::domain::*;
 use crate::mcp;
@@ -33,6 +34,20 @@ fn is_public(path: &str) -> bool {
     matches!(path, "/health" | "/" | "/app.js" | "/app.css" | "/save")
 }
 
+/// Origins the Marginalia desktop and mobile app's webview runs on: `tauri://localhost` (macOS, iOS, Linux) and
+/// `http(s)://tauri.localhost` (Windows, Android). The app is a different origin from the server, so the browser
+/// engine needs CORS to let its script read the API's answers. Nothing else is allowed: another website cannot read
+/// the API from a browser, and since auth is a bearer header (never a cookie) there is no ambient credential to abuse.
+const APP_ORIGINS: [&str; 3] = ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
+
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(APP_ORIGINS.map(header::HeaderValue::from_static)))
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(600))
+}
+
 #[derive(Clone)]
 struct SaveState {
     app: Arc<App>,
@@ -41,6 +56,7 @@ struct SaveState {
 
 /// REST routes, the web page, and the MCP endpoint at `/mcp`. With `token` set, everything except `GET /health`,
 /// the static page files and `GET /save` (which checks `?token=` itself) needs `Authorization: Bearer <token>`.
+/// CORS is open to the app's own origins only (see `APP_ORIGINS`).
 pub fn router(app: Arc<App>, token: Option<String>) -> Router {
     let token: Option<Arc<str>> = token.map(Arc::from);
     let save = Router::new()
@@ -69,6 +85,8 @@ pub fn router(app: Arc<App>, token: Option<String>) -> Router {
         .merge(save)
         .nest_service("/mcp", mcp::http_service(app))
         .layer(middleware::from_fn_with_state(token, require_bearer))
+        // Outermost, so a preflight (which carries no Authorization header) is answered before the token check.
+        .layer(cors())
 }
 
 // ---------- auth ----------
