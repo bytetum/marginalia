@@ -154,8 +154,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools cmake make
-          rustup toolchain install --profile minimal --target "$TARGET"
+          rustup toolchain install --profile minimal
+          rustup target add "$TARGET"
           rustc --version
+          rustup target list --installed
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: musl
