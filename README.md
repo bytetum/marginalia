@@ -160,6 +160,39 @@ Failures come back as tool errors.
 `skills/marginalia/SKILL.md` teaches a harness how to use the tools (search, read, cite, store products) and has
 example client configs. Copy it into the harness's skills directory.
 
+## Releases
+
+`.github/workflows/release.yml` tests, builds and smoke-tests every pull request (nothing is published from a PR) and
+publishes from `main` and from tags. The binary is a fully static `x86_64-unknown-linux-musl` build, so a Nix package can
+unpack the tarball and use it as is, with no `autoPatchelfHook`. On musl SurrealDB's jemalloc allocator replaces musl's
+slow malloc (the `allocator` feature, enabled for musl only in `Cargo.toml`).
+
+- **Nightly:** every push to `main` (and a manual run of the workflow on `main`) publishes a prerelease
+  `v<next patch>-nightly.<UTC commit time YYYYMMDDHHMMSS>`, e.g. `v0.1.1-nightly.20261030120000` for Cargo version
+  0.1.0. It is skipped if that release already exists. Nightlies are prereleases, so GitHub's "latest" stays the last stable release.
+- **Stable:** push a tag `vX.Y.Z` (it must equal the version in `Cargo.toml`) to publish release `vX.Y.Z`. A tag with a
+  suffix, such as `v1.0.0-rc.1`, is published as a prerelease.
+- **Version:** `marginalia --version` prints the release version (baked in at build time through `MARGINALIA_VERSION`);
+  a local build prints the Cargo version.
+- **Never pruned:** every release and tag is kept on purpose.
+
+Each release carries `marginalia-<version>-x86_64-linux.tar.gz` and `marginalia-<version>-x86_64-linux.tar.gz.sha256`
+(`<version>` has no `v`):
+
+```
+marginalia-<version>/
+  bin/marginalia
+  README.md
+  deploy/            systemd units, backup and kb-sync scripts, env.example
+```
+
+Verify a download with its checksum and its build provenance:
+
+```sh
+sha256sum -c marginalia-<version>-x86_64-linux.tar.gz.sha256
+gh attestation verify marginalia-<version>-x86_64-linux.tar.gz --repo bytetum/marginalia
+```
+
 ## Deploy (systemd user service)
 
 ```sh

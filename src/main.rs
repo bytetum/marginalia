@@ -15,7 +15,7 @@ use marginalia::{api, mcp};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Parser)]
-#[command(name = "marginalia", version, about = "Personal reading library with an agent, REST and MCP")]
+#[command(name = "marginalia", version = marginalia::VERSION, about = "Personal reading library with an agent, REST and MCP")]
 struct Cli {
     /// Directory holding `db/` (SurrealDB) and `blobs/` (raw pages).
     #[arg(long, global = true, env = "MARGINALIA_DATA", default_value = "./data")]
