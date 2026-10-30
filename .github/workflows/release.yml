@@ -536,6 +536,16 @@ jobs:
           fi
           (cd dist && sha256sum "$(basename "$out")" >"$(basename "$out").sha256")
           ls -l dist
+
+          # What ended up in the APK: identity, versions, the share intent filter, and the plugin class that Rust calls
+          # through JNI (it must survive R8 with its name).
+          aapt2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
+          "$aapt2" dump badging "$out" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code|^application-label:"
+          "$aapt2" dump badging "$out" | grep -q "package: name='com.bytetum.marginalia' versionCode='$VERSION_CODE' versionName='$VERSION'"
+          "$aapt2" dump xmltree --file AndroidManifest.xml "$out" | grep -q 'android.intent.action.SEND'
+          "$aapt2" dump xmltree --file AndroidManifest.xml "$out" | grep -q 'text/plain'
+          apkanalyzer=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/apkanalyzer | sort -V | tail -n1)
+          "$apkanalyzer" dex packages --defined-only "$out" | grep -E 'mobilesharetarget|Sharetarget' || { echo "::error::share-target plugin classes missing or renamed"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: marginalia-app-${{ env.VERSION }}-android
