@@ -28,12 +28,21 @@ struct Cli {
 enum Command {
     /// Serve REST and MCP (at /mcp) on one listener.
     Serve {
-        /// Listen address. Default: $HOST:$PORT when either is set, else 127.0.0.1:7878.
+        /// Listen address. Default: $HOST:$PORT when either is set, else 127.0.0.1:7878. Not with --socket.
         #[arg(long, env = "MARGINALIA_BIND")]
         bind: Option<String>,
+        /// Listen on this Unix socket instead of TCP (HOST/PORT are ignored). Put it in a directory only the owner and
+        /// tailscaled can open: that is what makes --tailscale-login safe.
+        #[arg(long, env = "MARGINALIA_SOCKET")]
+        socket: Option<PathBuf>,
         /// Static bearer token required on everything except GET /health. Or set MARGINALIA_TOKEN_FILE.
         #[arg(long, env = "MARGINALIA_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Tailscale login (e.g. alice@github) whose devices need no token, via the `Tailscale-User-Login` header that
+        /// `tailscale serve` adds. Repeatable, or comma-separated in MARGINALIA_TAILSCALE_LOGINS. Only honoured with
+        /// --socket: any local account could forge the header over TCP, so there it is ignored (with a warning).
+        #[arg(long = "tailscale-login", env = "MARGINALIA_TAILSCALE_LOGINS", value_delimiter = ',')]
+        tailscale_logins: Vec<String>,
     },
     /// Serve MCP over stdio (for harnesses that spawn the server).
     Mcp,
@@ -55,7 +64,9 @@ enum Command {
 
 /// Minimal .env loader: KEY=VALUE lines, # comments; variables already set win.
 fn load_dotenv() {
-    let Ok(raw) = std::fs::read_to_string(".env") else { return };
+    let Ok(raw) = std::fs::read_to_string(".env") else {
+        return;
+    };
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -83,7 +94,9 @@ fn env_opt(key: &str) -> Option<String> {
 /// Giving both is an error, and so is an empty file: a blank token would silently turn auth off.
 fn resolve_secret(name: &str, direct: Option<String>, file: Option<String>) -> Result<Option<String>> {
     let direct = direct.filter(|v| !v.trim().is_empty());
-    let Some(path) = file.filter(|v| !v.trim().is_empty()) else { return Ok(direct) };
+    let Some(path) = file.filter(|v| !v.trim().is_empty()) else {
+        return Ok(direct);
+    };
     anyhow::ensure!(direct.is_none(), "set either {name} or {name}_FILE, not both");
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {name}_FILE {path}"))?;
     let secret = raw.trim_end_matches(['\n', '\r']);
@@ -110,6 +123,32 @@ fn resolve_bind(bind: Option<String>, host: Option<String>, port: Option<String>
     let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
     let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host };
     format!("{host}:{}", port.unwrap_or_else(|| "7878".to_string()))
+}
+
+/// Where `serve` listens.
+#[derive(Debug, PartialEq)]
+enum Listen {
+    Tcp(String),
+    Unix(PathBuf),
+}
+
+/// `--socket` selects a Unix socket and cannot be combined with an explicit `--bind`/`MARGINALIA_BIND` (HOST and PORT
+/// are only defaults, so they are simply ignored then); otherwise `resolve_bind` decides the TCP address.
+fn resolve_listen(
+    bind: Option<String>,
+    socket: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<String>,
+) -> Result<Listen> {
+    let socket = socket.filter(|p| !p.as_os_str().to_string_lossy().trim().is_empty());
+    let Some(socket) = socket else {
+        return Ok(Listen::Tcp(resolve_bind(bind, host, port)));
+    };
+    anyhow::ensure!(
+        bind.as_deref().is_none_or(|b| b.trim().is_empty()),
+        "set either --socket (MARGINALIA_SOCKET) or --bind (MARGINALIA_BIND), not both"
+    );
+    Ok(Listen::Unix(socket))
 }
 
 fn app_config() -> Result<AppConfig> {
@@ -148,10 +187,10 @@ async fn run(cli: Cli) -> Result<()> {
     };
     let app = build_app(&cli.data_dir).await?;
     match cli.command {
-        Command::Serve { bind, token } => {
+        Command::Serve { bind, socket, token, tailscale_logins } => {
             let token = resolve_secret("MARGINALIA_TOKEN", token, std::env::var("MARGINALIA_TOKEN_FILE").ok())?;
-            let bind = resolve_bind(bind, std::env::var("HOST").ok(), std::env::var("PORT").ok());
-            serve(app, &bind, token).await
+            let listen = resolve_listen(bind, socket, std::env::var("HOST").ok(), std::env::var("PORT").ok())?;
+            serve(app, listen, token, tailscale_logins).await
         }
         Command::Mcp => {
             // stdout carries the protocol; anything human-readable goes to stderr.
@@ -189,38 +228,118 @@ fn read_export(file: &Path) -> Result<LibraryExport> {
     serde_json::from_slice(&raw).with_context(|| format!("{} is not a Marginalia export", file.display()))
 }
 
-async fn serve(app: Arc<App>, bind: &str, token: Option<String>) -> Result<()> {
-    let loopback = bind.parse::<SocketAddr>().map(|a| a.ip().is_loopback()).unwrap_or_else(|_| bind.starts_with("localhost"));
-    if token.is_none() && !loopback {
-        eprintln!("WARNING: binding to {bind} (not loopback) with NO bearer token: anyone who can reach it can read and write the library.");
-        eprintln!("WARNING: set MARGINALIA_TOKEN or pass --token.");
+async fn serve(app: Arc<App>, listen: Listen, token: Option<String>, tailscale_logins: Vec<String>) -> Result<()> {
+    let tailscale_logins: Vec<String> =
+        tailscale_logins.into_iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if let Listen::Tcp(bind) = &listen {
+        let loopback =
+            bind.parse::<SocketAddr>().map(|a| a.ip().is_loopback()).unwrap_or_else(|_| bind.starts_with("localhost"));
+        if token.is_none() && !loopback {
+            eprintln!(
+                "WARNING: binding to {bind} (not loopback) with NO bearer token: anyone who can reach it can read and write the library."
+            );
+            eprintln!("WARNING: set MARGINALIA_TOKEN or pass --token.");
+        }
+        if !tailscale_logins.is_empty() {
+            eprintln!(
+                "WARNING: ignoring --tailscale-login on TCP ({bind}): any local account could forge the Tailscale-User-Login header."
+            );
+            eprintln!(
+                "WARNING: listen on a Unix socket in an owner-only directory (--socket) to use it; the bearer token is still required here."
+            );
+        }
+    } else if token.is_none() && !tailscale_logins.is_empty() {
+        eprintln!(
+            "WARNING: --tailscale-login has no effect without a bearer token: auth is off, so everyone is let in."
+        );
     }
+    let trusted = if matches!(listen, Listen::Unix(_)) { tailscale_logins.clone() } else { Vec::new() };
+    let auth_label = match (token.is_some(), trusted.is_empty()) {
+        (false, _) => "off".to_string(),
+        (true, true) => "bearer token".to_string(),
+        (true, false) => format!("bearer token or Tailscale login ({})", trusted.join(", ")),
+    };
     let llm = app.has_llm();
-    let router = api::router(app, token.clone());
-    let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
-    eprintln!(
-        "marginalia listening on http://{} (REST, MCP at /mcp) · auth {} · LLM {}",
-        listener.local_addr()?,
-        if token.is_some() { "bearer token" } else { "off" },
-        if llm { "on" } else { "off" },
-    );
+    let router = api::router(app, api::Auth { token, tailscale_logins: trusted });
+
     // Stop accepting on the signal and let in-flight requests finish. Long-lived MCP event streams never finish on
     // their own, so after SHUTDOWN_GRACE the remaining connections are dropped instead of hanging the stop.
     let (signalled, on_signal) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+    let shutdown = async move {
         shutdown_signal().await;
         eprintln!("marginalia: shutting down");
         let _ = signalled.send(());
-    });
-    tokio::select! {
-        result = server => result?,
+    };
+    let mut socket_path = None;
+    let server: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> = match &listen {
+        Listen::Tcp(bind) => {
+            let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
+            eprintln!(
+                "marginalia listening on http://{} (REST, MCP at /mcp) · auth {auth_label} · LLM {}",
+                listener.local_addr()?,
+                if llm { "on" } else { "off" },
+            );
+            Box::pin(std::future::IntoFuture::into_future(
+                axum::serve(listener, router).with_graceful_shutdown(shutdown),
+            ))
+        }
+        #[cfg(unix)]
+        Listen::Unix(path) => {
+            remove_stale_socket(path)?;
+            let listener =
+                tokio::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+            socket_path = Some(path.clone());
+            eprintln!(
+                "marginalia listening on unix:{} (REST, MCP at /mcp) · auth {auth_label} · LLM {}",
+                path.display(),
+                if llm { "on" } else { "off" },
+            );
+            Box::pin(std::future::IntoFuture::into_future(
+                axum::serve(listener, router).with_graceful_shutdown(shutdown),
+            ))
+        }
+        #[cfg(not(unix))]
+        Listen::Unix(_) => anyhow::bail!("--socket needs a Unix platform"),
+    };
+    let result = tokio::select! {
+        result = server => result.map_err(anyhow::Error::from),
         _ = async {
             let _ = on_signal.await;
             tokio::time::sleep(SHUTDOWN_GRACE).await;
-        } => eprintln!("marginalia: closing connections still open after {}s", SHUTDOWN_GRACE.as_secs()),
+        } => {
+            eprintln!("marginalia: closing connections still open after {}s", SHUTDOWN_GRACE.as_secs());
+            Ok(())
+        }
+    };
+    if let Some(path) = socket_path {
+        let _ = std::fs::remove_file(path); // best effort: the next start also clears a stale socket
     }
+    result?;
     eprintln!("marginalia: stopped");
     Ok(())
+}
+
+/// Frees `path` for binding. A socket left behind by a crash is removed; a live one (something still accepts on it)
+/// or any other kind of file is refused, so a typo cannot delete a real file or steal a running server's socket.
+#[cfg(unix)]
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
+    };
+    anyhow::ensure!(
+        meta.file_type().is_socket(),
+        "{} exists and is not a socket; refusing to remove it",
+        path.display()
+    );
+    anyhow::ensure!(
+        std::os::unix::net::UnixStream::connect(path).is_err(),
+        "{} is in use by another process",
+        path.display()
+    );
+    std::fs::remove_file(path).with_context(|| format!("removing stale socket {}", path.display()))
 }
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -338,6 +457,54 @@ mod tests {
         assert_eq!(resolve_bind(None, s("10.0.0.5"), None), "10.0.0.5:7878");
         assert_eq!(resolve_bind(None, s("::1"), s("80")), "[::1]:80");
         assert_eq!(resolve_bind(s("  "), s(""), s("9")), "127.0.0.1:9");
+    }
+
+    #[test]
+    fn listen_is_tcp_or_socket_never_both() -> Result<()> {
+        let sock = || Some(PathBuf::from("/run/m/m.sock"));
+        assert_eq!(resolve_listen(None, None, None, None)?, Listen::Tcp("127.0.0.1:7878".into()));
+        assert_eq!(resolve_listen(s("0.0.0.0:1"), None, None, None)?, Listen::Tcp("0.0.0.0:1".into()));
+        assert_eq!(
+            resolve_listen(None, sock(), s("0.0.0.0"), s("9000"))?,
+            Listen::Unix("/run/m/m.sock".into()),
+            "HOST/PORT are ignored"
+        );
+        assert_eq!(
+            resolve_listen(s("  "), sock(), None, None)?,
+            Listen::Unix("/run/m/m.sock".into()),
+            "blank bind is unset"
+        );
+        assert_eq!(
+            resolve_listen(None, Some(PathBuf::new()), None, None)?,
+            Listen::Tcp("127.0.0.1:7878".into()),
+            "blank socket is unset"
+        );
+        let both = resolve_listen(s("127.0.0.1:1"), sock(), None, None).unwrap_err().to_string();
+        assert!(both.contains("not both"), "{both}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_dead_socket_is_removed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("m.sock");
+        remove_stale_socket(&path)?; // nothing there
+
+        let live = std::os::unix::net::UnixListener::bind(&path)?;
+        let busy = remove_stale_socket(&path).unwrap_err().to_string();
+        assert!(busy.contains("in use"), "{busy}");
+        drop(live); // closing leaves the file behind, as a crash would
+        assert!(path.exists());
+        remove_stale_socket(&path)?;
+        assert!(!path.exists());
+
+        let file = dir.path().join("data");
+        std::fs::write(&file, "keep")?;
+        let refused = remove_stale_socket(&file).unwrap_err().to_string();
+        assert!(refused.contains("not a socket"), "{refused}");
+        assert!(file.exists());
+        Ok(())
     }
 
     #[test]

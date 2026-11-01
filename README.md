@@ -52,10 +52,13 @@ Environment variables, or a `.env` file in the current directory (real variables
 | --- | --- | --- |
 | `MARGINALIA_DATA` (`--data-dir`) | `./data` | `db/` is SurrealDB, `blobs/` raw pages |
 | `MARGINALIA_BIND` (`serve --bind`) | none | listen address of `serve`, e.g. `100.103.153.13:7878`; wins over `HOST`/`PORT` |
+| `MARGINALIA_SOCKET` (`serve --socket`) | none | listen on this Unix socket instead of TCP (see Tailscale login); an error together with `MARGINALIA_BIND`, and `HOST`/`PORT` are then ignored |
 | `HOST` | `127.0.0.1` | listen host, used when `MARGINALIA_BIND` is not set and `HOST` or `PORT` is |
 | `PORT` | `7878` | listen port, same rule |
 | `MARGINALIA_TOKEN` (`serve --token`) | none | bearer token for REST and `/mcp`; unset means no auth |
 | `MARGINALIA_TOKEN_FILE` | none | path of a file holding the token (trailing newline dropped); not together with `MARGINALIA_TOKEN` |
+| `MARGINALIA_TAILSCALE_LOGINS` (`serve --tailscale-login`, repeatable) | none | comma-separated Tailscale logins (e.g. `bytetum@github`) whose devices need no token; honoured on a Unix socket only |
+| `MARGINALIA_URL` | none | full base URL of the server (e.g. `https://marginalia-bytetum.taild98079.ts.net`); read by the deploy scripts (`marginalia-backup.sh`, `marginalia-kb-sync.py`), wins over `MARGINALIA_BIND` there. The server itself ignores it |
 | `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible chat API |
 | `LLM_MODEL` | `deepseek-chat` | model name sent to that API |
 | `LLM_API_KEY` | none | without it the built-in agent is off (chat, analyse, brief answer 503) |
@@ -72,7 +75,8 @@ while `marginalia serve` is using it.
 ## CLI
 
 ```
-marginalia [--data-dir DIR] serve [--bind ADDR] [--token TOKEN]   REST + MCP (/mcp) on one listener (stops on Ctrl-C or SIGTERM)
+marginalia [--data-dir DIR] serve [--bind ADDR | --socket PATH] [--token TOKEN] [--tailscale-login LOGIN]...
+                                                                 REST + MCP (/mcp) on one listener (stops on Ctrl-C or SIGTERM)
 marginalia mcp                                                   MCP over stdio (logs go to stderr)
 marginalia add <url>                                             save an article
 marginalia chat                                                  REPL: /add /list /analyse <id> [direction] /brief [direction] /new /quit
@@ -80,13 +84,15 @@ marginalia brief [direction...]                                  write and save 
 marginalia import <file.json>                                    restore a snapshot into an empty library (offline, see Backup & restore)
 ```
 
-`serve` warns loudly if it binds a non-loopback address without a token. On a stop signal it finishes in-flight requests and
+`serve` warns loudly if it binds a non-loopback address without a token. With `--socket` it removes a stale socket file
+at that path first (refusing anything that is not a socket, or a socket another process still accepts on) and removes it again on a clean stop. On a stop signal it finishes in-flight requests and
 closes lingering MCP event streams after 5 seconds.
 
 ## REST
 
 JSON in and out. With a token set, send `Authorization: Bearer <token>` on everything except `GET /health`, the web
-page files (`/`, `/app.js`, `/app.css`; they hold no data) and `GET /save` (see Quick save).
+page files (`/`, `/app.js`, `/app.css`; they hold no data) and `GET /save` (see Quick save). On a Unix socket, a trusted
+`Tailscale-User-Login` header works instead of the token (see Tailscale login).
 Errors are `{"error": "..."}`: 400 invalid input, 401 auth, 404 not found, 502 upstream (fetch or LLM), 503 no LLM, 500 storage.
 
 | Method and path | Body / query | Result |
@@ -108,15 +114,41 @@ Errors are `{"error": "..."}`: 400 invalid input, 401 auth, 404 not found, 502 u
 | `GET /syntheses` | `kind` (analysis or brief), `limit` (20) | syntheses, newest first |
 | `GET /syntheses/{id}` | | one synthesis |
 | `GET /syntheses/{id}/html` | | the synthesis body as sanitised HTML |
-| `GET /save` | `url`, `token` (query only here) | saves the page, then 303 to `/#/a/<id>` (see Quick save) |
+| `GET /me` | | `{"auth": "token" \| "tailscale" \| "none", "login": string or null}`: how this request was authorised |
+| `GET /save` | `url`, `token` (query only here; not needed with a trusted Tailscale login) | saves the page, then 303 to `/#/a/<id>` (see Quick save) |
 | `GET /export` | | whole-library snapshot `{version, exported_at, articles, highlights, syntheses}` (see Backup & restore) |
+
+## Tailscale login (no token on your own devices)
+
+Behind `tailscale serve` (for example a Tailscale Service that proxies HTTPS to the backend), tailscaled adds
+`Tailscale-User-Login: <login>` (say `bytetum@github`) to requests from personal, untagged devices, and strips any copy the
+client sent. It adds nothing for tagged devices (servers), which keep using the bearer token. To let your own devices in
+with no token, run the backend on a Unix socket and name the login:
+
+```sh
+marginalia serve --socket "$XDG_RUNTIME_DIR/marginalia/m.sock" --tailscale-login bytetum@github   # with MARGINALIA_TOKEN set
+```
+
+A request is accepted when it has the right bearer token, or (socket only) a `Tailscale-User-Login` equal to one of the
+logins (ASCII case-insensitive, trimmed, exactly one header). With no token configured the server stays open as before.
+
+Why only on a socket: the header is just text, so it proves nothing unless the sender cannot be anyone but tailscaled.
+Put the socket in a directory with mode 0700: only the owner and root (tailscaled runs as root) can open it, so no other
+account on a shared host can forge the header, while programs on the server (the backup and kb-sync scripts, MCP
+clients) use the token over the HTTPS URL like any tagged device. Over TCP any local account could connect to
+`127.0.0.1` and send the header, so `serve` ignores `--tailscale-login` there and says so at startup. One more guard: a
+state-changing request (POST, DELETE) authorised only by the login is refused with 403 when the browser marks it
+cross-site (`Sec-Fetch-Site`), because unlike a bearer token the login is sent automatically; the app's own origins are
+exempt. `GET /save?url=` is a plain link and stays open to the login, so a hostile page could make your browser save an
+article; it cannot read anything.
 
 ## Web page
 
 `http://<bind>/` serves a small page from the same server: library (save box, search, article list), reader
 (highlights marked in the text; select text and tap Highlight, with an optional note), and syntheses. Plain JS and CSS
-embedded from `web/`, no build step, nothing loaded from other hosts. On first visit it asks for the token and keeps it in
-the browser's localStorage; a 401 sends you back to that prompt. There is no HTTPS, so there is no service worker or
+embedded from `web/`, no build step, nothing loaded from other hosts. On first visit it asks `GET /me` without a token: if the
+server recognises the device (see Tailscale login) it opens straight away and sends no `Authorization` header; otherwise it
+asks for the token and keeps it in the browser's localStorage. A 401 sends you back to that prompt. There is no HTTPS, so there is no service worker or
 PWA install: use it as a normal page (on a phone, "Add to Home Screen" gives a plain shortcut).
 
 Markdown is rendered on the server (`src/render.rs`, `pulldown-cmark`): raw HTML in an article is shown as text, links
@@ -142,16 +174,18 @@ personal Tailscale-only service; rotate `MARGINALIA_TOKEN` if a device is lost.
 
 - **Desktop bookmarklet.** Make a bookmark whose URL is (replace `TOKEN`):
   ```
-  javascript:location='http://100.103.153.13:7878/save?url='+encodeURIComponent(location.href)+'&token=TOKEN'
+  javascript:location='https://marginalia-bytetum.taild98079.ts.net/save?url='+encodeURIComponent(location.href)+'&token=TOKEN'
   ```
   The token is stored in the browser's bookmarks (and synced with them, if you sync).
 - **iOS Shortcut** (no token in any URL). New shortcut, enable "Show in Share Sheet", accept URLs. Actions:
-  1. Get Contents of URL: `http://100.103.153.13:7878/articles`, Method POST, Request Body JSON with a field `url`
+  1. Get Contents of URL: `https://marginalia-bytetum.taild98079.ts.net/articles`, Method POST, Request Body JSON with a field `url`
      set to the Shortcut Input, header `Authorization` = `Bearer TOKEN`.
   2. Show Result (or Show Notification).
 
   Saving fetches and cleans the page, so allow a few seconds. The shortcut keeps the token inside the shortcut.
-- **Android.** Install the HTTP Shortcuts app: create a shortcut with POST `http://100.103.153.13:7878/articles`,
+  On devices signed in to Tailscale as the owner (with `--tailscale-login`), the bookmarklet can drop `&token=TOKEN`
+  and the shortcuts can drop the `Authorization` header.
+- **Android.** Install the HTTP Shortcuts app: create a shortcut with POST `https://marginalia-bytetum.taild98079.ts.net/articles`,
   JSON body `{"url": "<shared text>"}` (insert the app's shared-text variable), header `Authorization: Bearer TOKEN`, and enable it as a
   share target. Or use the bookmarklet above in a browser that allows `javascript:` bookmarks (Firefox does; Chrome
   only from the address bar).
@@ -238,7 +272,7 @@ There is no REST import; restoring is a CLI action on a stopped server.
 
 ### Nightly backup (systemd user timer)
 
-`deploy/marginalia-backup.sh` fetches `/export` (it reads `MARGINALIA_BIND` and `MARGINALIA_TOKEN` from the environment
+`deploy/marginalia-backup.sh` fetches `/export` (it reads `MARGINALIA_URL` or else `MARGINALIA_BIND`, and `MARGINALIA_TOKEN`, from the environment
 or `~/.config/marginalia/env`), refuses an empty or invalid result, and writes
 `~/.local/share/marginalia/backups/<YYYY-MM-DD>/library.json` plus a hard-linked copy of `data/blobs` in that directory's
 `blobs/`. It keeps the newest 14 dated directories. Running it twice on the same day replaces that day's backup.
