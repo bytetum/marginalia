@@ -35,14 +35,14 @@ async fn get(router: &Router, uri: &str, token: Option<&str>) -> (Response<Body>
     (Response::from_parts(parts, Body::empty()), String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn header_of<'a>(res: &'a Response<Body>, name: header::HeaderName) -> &'a str {
+fn header_of(res: &Response<Body>, name: header::HeaderName) -> &str {
     res.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
 #[tokio::test]
 async fn static_files_are_public_with_the_right_content_types() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, api::Auth { token: Some(TOKEN.into()), ..Default::default() });
 
     for (path, content_type, needle) in [
         ("/", "text/html; charset=utf-8", "<title>Marginalia</title>"),
@@ -73,7 +73,7 @@ async fn article_html_needs_the_token_and_escapes_script() {
         )
         .await
         .expect("save");
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, api::Auth { token: Some(TOKEN.into()), ..Default::default() });
     let uri = format!("/articles/{}/html", article.id);
 
     assert_eq!(get(&router, &uri, None).await.0.status(), StatusCode::UNAUTHORIZED);
@@ -107,7 +107,7 @@ async fn synthesis_html_is_rendered_and_protected() {
         })
         .await
         .expect("synthesis");
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, api::Auth { token: Some(TOKEN.into()), ..Default::default() });
     let uri = format!("/syntheses/{}/html", synthesis.id);
 
     assert_eq!(get(&router, &uri, None).await.0.status(), StatusCode::UNAUTHORIZED);
@@ -121,7 +121,7 @@ async fn synthesis_html_is_rendered_and_protected() {
 #[tokio::test]
 async fn save_link_rejects_a_missing_or_bad_token() {
     let (app, _dir) = app();
-    let router = api::router(app.clone(), Some(TOKEN.into()));
+    let router = api::router(app.clone(), api::Auth { token: Some(TOKEN.into()), ..Default::default() });
     // The URL is unreachable on purpose: a request that passes auth would try to fetch it, and these must not.
     let url = "url=http%3A%2F%2F127.0.0.1%3A9%2Fnever";
 
@@ -163,7 +163,7 @@ async fn save_link_saves_then_redirects_to_the_reader() {
     });
 
     let (app, _dir) = app();
-    let router = api::router(app.clone(), Some(TOKEN.into()));
+    let router = api::router(app.clone(), api::Auth { token: Some(TOKEN.into()), ..Default::default() });
     let target = format!("http://{addr}/sodium");
     let (res, _) = get(&router, &format!("/save?token={TOKEN}&url={target}"), None).await;
 
@@ -179,7 +179,7 @@ async fn save_link_saves_then_redirects_to_the_reader() {
 #[tokio::test]
 async fn save_link_reports_fetch_errors_as_a_page_without_the_token() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, api::Auth { token: Some(TOKEN.into()), ..Default::default() });
     // Not http(s): rejected before any network use.
     let (res, body) = get(&router, &format!("/save?token={TOKEN}&url=ftp%3A%2F%2Fx.test%2F%3Cb%3E"), None).await;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -191,7 +191,7 @@ async fn save_link_reports_fetch_errors_as_a_page_without_the_token() {
 #[tokio::test]
 async fn save_link_without_a_configured_token_is_open_but_still_validates() {
     let (app, _dir) = app();
-    let router = api::router(app, None);
+    let router = api::router(app, api::Auth::default());
     assert_eq!(get(&router, "/save", None).await.0.status(), StatusCode::BAD_REQUEST);
     assert_eq!(get(&router, "/save?url=ftp%3A%2F%2Fx.test", None).await.0.status(), StatusCode::BAD_REQUEST);
 }

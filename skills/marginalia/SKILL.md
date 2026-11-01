@@ -44,7 +44,7 @@ Streamable HTTP (server started with `marginalia serve`, MCP at `/mcp`):
   "mcpServers": {
     "marginalia": {
       "type": "http",
-      "url": "http://100.103.153.13:7878/mcp",
+      "url": "https://marginalia-bytetum.taild98079.ts.net/mcp",
       "headers": { "Authorization": "Bearer <MARGINALIA_TOKEN>" }
     }
   }

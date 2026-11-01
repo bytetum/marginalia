@@ -3,6 +3,8 @@
 # Install as ~/.local/bin/marginalia-backup (see README, "Backup & restore"); run by marginalia-backup.timer.
 #
 # Settings come from the environment, else from ~/.config/marginalia/env (KEY=VALUE lines, as for the service):
+#   MARGINALIA_URL          full base URL of the server, e.g. https://host (wins over MARGINALIA_BIND; use it when
+#                           the server is behind a proxy such as a Tailscale Service, or listens on a Unix socket)
 #   MARGINALIA_BIND         address of `marginalia serve`        (default 127.0.0.1:7878)
 #   MARGINALIA_TOKEN        bearer token, if the server has one
 #   MARGINALIA_DATA         data dir holding blobs/               (default ~/.local/share/marginalia/data)
@@ -42,6 +44,7 @@ setting() {
   printf '%s\n' "${value:-$default}"
 }
 
+URL=$(setting MARGINALIA_URL "")
 BIND=$(setting MARGINALIA_BIND 127.0.0.1:7878)
 TOKEN=$(setting MARGINALIA_TOKEN "")
 DATA_DIR=$(setting MARGINALIA_DATA "$HOME/.local/share/marginalia/data")
@@ -51,6 +54,9 @@ BACKUP_ROOT=$(setting MARGINALIA_BACKUP_DIR "$HOME/.local/share/marginalia/backu
 case "$BIND" in
   0.0.0.0:* | "[::]:"*) BIND="127.0.0.1:${BIND##*:}" ;;
 esac
+# MARGINALIA_URL wins over MARGINALIA_BIND.
+BASE=${URL%/}
+BASE=${BASE:-http://$BIND}
 
 command -v curl >/dev/null || die "curl is required"
 
@@ -95,8 +101,8 @@ if [[ -n "$TOKEN" ]]; then
   auth_config=$(printf 'header = "Authorization: Bearer %s"' "$esc")
 fi
 printf '%s\n' "$auth_config" |
-  curl --config - --fail --silent --show-error --max-time 600 --output "$TMP" "http://$BIND/export" ||
-  die "could not fetch http://$BIND/export (is marginalia serve running? is the token right?)"
+  curl --config - --fail --silent --show-error --max-time 600 --output "$TMP" "$BASE/export" ||
+  die "could not fetch $BASE/export (is marginalia serve running? is the token right?)"
 
 check_export "$TMP"
 chmod 600 "$TMP"

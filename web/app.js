@@ -1,5 +1,6 @@
-// Marginalia web page. Plain JS, no dependencies. All data comes from the REST API with a bearer token; the only HTML
-// ever inserted with innerHTML is what the server sanitised (/articles/{id}/html).
+// Marginalia web page. Plain JS, no dependencies. All data comes from the REST API with a bearer token, or with none
+// on a device the server recognises as the owner's (Tailscale identity, see probeTailscale); the only HTML ever
+// inserted with innerHTML is what the server sanitised (/articles/{id}/html).
 //
 // The same files run in two places:
 //   - the browser page served by the server itself: API calls are same-origin (API_BASE is ''), and the token lives in
@@ -21,6 +22,8 @@
   let reader = null; // {id, body} while the reader view is showing
 
   class AuthError extends Error {}
+  const REJECTED = 'Token rejected, enter it again.';
+  const NEEDED = 'Enter the access token.';
 
   // ---------- environment ----------
 
@@ -28,6 +31,7 @@
   const invoke = (cmd, args) => (window.__TAURI__ && window.__TAURI__.core ? window.__TAURI__.core.invoke : window.__TAURI_INTERNALS__.invoke)(cmd, args);
   let API_BASE = ''; // '' = same origin (the browser page); the server URL, with no trailing slash, in the app
   let appToken = null; // the app's copy of the keychain token
+  let tokenless = false; // the server let this device in with no token (Tailscale identity), so none is needed
   let appInfo = { version: '', tokenStorage: '', share: false };
 
   const getToken = () => (IN_APP ? appToken : localStorage.getItem(TOKEN_KEY));
@@ -47,7 +51,7 @@
     else localStorage.removeItem(TOKEN_KEY);
   }
 
-  const isConfigured = () => !!getToken() && (!IN_APP || !!API_BASE);
+  const isConfigured = () => (!!getToken() || tokenless) && (!IN_APP || !!API_BASE);
 
   async function loadConfig() {
     if (!IN_APP) return;
@@ -57,6 +61,23 @@
       appToken = await invoke('get_token');
     } catch (e) {
       console.error('app startup failed', e);
+    }
+  }
+
+  // With no stored token, ask GET /me without one. 200 means the server recognised this device (a Tailscale login it
+  // trusts, or it has no token at all), so no token is needed; 401 or no answer means show the token form. In the app
+  // the server is the saved URL, or the default one before first setup (kept once it answers).
+  async function probeTailscale() {
+    if (getToken()) return;
+    const base = IN_APP ? API_BASE || DEFAULT_SERVER : API_BASE;
+    try {
+      tokenless = (await request(base, null, '/me', { timeout: 10000 })).ok;
+    } catch (_) {
+      tokenless = false;
+    }
+    if (tokenless && IN_APP && !API_BASE) {
+      API_BASE = base;
+      localStorage.setItem(SERVER_KEY, base);
     }
   }
 
@@ -74,8 +95,9 @@
     return el;
   }
 
-  // The one place that talks to the server: adds the base URL and the bearer token. A network failure becomes a
-  // readable Error (browsers say "Failed to fetch" or "Load failed").
+  // The one place that talks to the server: adds the base URL and the bearer token (none on a Tailscale-recognised
+  // device: the Authorization header is left out). A network failure becomes a readable Error (browsers say "Failed
+  // to fetch" or "Load failed").
   async function request(base, token, path, { json, method, timeout } = {}) {
     const init = { method: method || (json === undefined ? 'GET' : 'POST'), headers: {} };
     if (token) init.headers.Authorization = 'Bearer ' + token;
@@ -103,11 +125,12 @@
 
   async function api(path, { json, method } = {}) {
     const token = getToken();
-    if (!token) throw new AuthError();
+    if (!token && !tokenless) throw new AuthError(NEEDED);
     const res = await request(API_BASE, token, path, { json, method });
     if (res.status === 401) {
       await clearToken();
-      throw new AuthError();
+      tokenless = false; // show the token form rather than retry the same unauthorised request
+      throw new AuthError(token ? REJECTED : NEEDED);
     }
     if (!res.ok) throw new Error(await errorMessage(res));
     return (res.headers.get('content-type') || '').includes('json') ? res.json() : res.text();
@@ -153,7 +176,7 @@
         status.textContent = e instanceof AuthError ? 'That token was not accepted.' : e.message;
       }
     } }, input, h('button', { type: 'submit' }, 'Sign in'));
-    show(h('h1', null, 'Marginalia'), h('p', { class: 'muted' }, 'Enter the access token. It is kept in this browser only.'), form, status);
+    show(h('h1', null, 'Marginalia'), h('p', { class: 'muted' }, 'Enter the access token. It is kept in this browser only. Devices signed in to Tailscale as the owner get in without a token.'), form, status);
     input.focus();
   }
 
@@ -176,9 +199,10 @@
     const body = await health.json().catch(() => null);
     if (!body || body.ok !== true) throw new Error('That does not look like a Marginalia server.');
     const res = await request(base, token, '/articles?limit=1', { timeout: 10000 });
-    if (res.status === 401) throw new Error('The server is reachable, but it rejected the token.');
+    if (res.status === 401) throw new Error(token ? 'The server is reachable, but it rejected the token.'
+      : 'The server is reachable, but needs an access token: this device is not signed in to Tailscale as its owner.');
     if (!res.ok) throw new Error(await errorMessage(res));
-    return 'Connected. The token is accepted' + (body.llm ? '.' : ' (the server has no LLM configured, so chat, analyses and briefs are off).');
+    return 'Connected. ' + (token ? 'The token is accepted' : 'No token needed on this device') + (body.llm ? '.' : ' (the server has no LLM configured, so chat, analyses and briefs are off).');
   }
 
   // First-run screen and settings in one: server URL + token, test, save, and sign out.
@@ -188,7 +212,7 @@
     const server = h('input', { type: 'url', inputmode: 'url', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', autocomplete: 'off',
       placeholder: DEFAULT_SERVER, value: API_BASE || DEFAULT_SERVER, 'aria-label': 'Server URL', required: true });
     const token = h('input', { type: 'password', autocomplete: 'off', autocapitalize: 'none',
-      placeholder: settings && hasToken ? 'Leave empty to keep the current token' : 'Access token', 'aria-label': 'Access token' });
+      placeholder: settings && hasToken ? 'Leave empty to keep the current token' : 'Access token (not needed when signed in to Tailscale as the owner)', 'aria-label': 'Access token' });
     const status = h('p', { class: 'status' + (message ? ' error' : ' muted'), 'aria-live': 'polite' }, message || '');
     const testBtn = h('button', { type: 'button', class: 'secondary' }, 'Test connection');
     const saveBtn = h('button', { type: 'submit' }, settings ? 'Save' : 'Connect');
@@ -197,7 +221,6 @@
       const base = normalizeServer(server.value);
       const tok = token.value.trim() || (settings && hasToken ? getToken() : '');
       if (!base) throw new Error('Enter the server URL, for example ' + DEFAULT_SERVER);
-      if (!tok) throw new Error('Enter the access token.');
       return { base, tok };
     };
     const run = async (save) => {
@@ -214,7 +237,13 @@
         }
         localStorage.setItem(SERVER_KEY, base);
         API_BASE = base;
-        await setToken(tok);
+        if (tok) {
+          await setToken(tok);
+          tokenless = false;
+        } else {
+          await clearToken(); // it got in with no token: Tailscale knows this device
+          tokenless = true;
+        }
         if (location.hash === '#/') await route();
         else location.hash = '#/';
         drainShares();
@@ -236,10 +265,11 @@
       h('h1', null, settings ? 'Settings' : 'Marginalia'),
       h('p', { class: 'muted' }, settings
         ? 'Server and access token for this app.' + where
-        : 'Connect to your Marginalia server. This device must be on Tailscale.' + where),
+        : 'Connect to your Marginalia server. This device must be on Tailscale; devices signed in as the owner need no token.' + where),
       form,
       settings ? h('div', { class: 'row' }, h('button', { type: 'button', class: 'secondary', onclick: async () => {
         await clearToken();
+        tokenless = false;
         route();
       } }, 'Sign out')) : null,
       settings && appInfo.version ? h('p', { class: 'meta' }, 'Marginalia app ' + appInfo.version) : null);
@@ -274,7 +304,7 @@
         const article = await api('/articles', { json: { url } });
         location.hash = '#/a/' + encodeURIComponent(article.id);
       } catch (e) {
-        if (e instanceof AuthError) return showLogin('Token rejected, enter it again.');
+        if (e instanceof AuthError) return showLogin(e.message);
         saveStatus.className = 'status error';
         saveStatus.textContent = 'Could not save: ' + e.message;
         saveBtn.disabled = false;
@@ -295,7 +325,7 @@
         listBox.hidden = true;
         results.replaceChildren(hits.length ? h('ul', { class: 'list' }, hits.map(hitItem)) : h('p', { class: 'muted' }, 'No matches.'));
       } catch (e) {
-        if (e instanceof AuthError) return showLogin('Token rejected, enter it again.');
+        if (e instanceof AuthError) return showLogin(e.message);
         results.replaceChildren(errorNode(e));
       }
     };
@@ -505,7 +535,7 @@
         await route();
         window.scrollTo(0, y);
       } catch (e) {
-        if (e instanceof AuthError) return showLogin('Token rejected, enter it again.');
+        if (e instanceof AuthError) return showLogin(e.message);
         err.textContent = e.message;
         save.disabled = false;
       }
@@ -628,7 +658,7 @@
       toast('Saved: ' + article.title, { action: { href: '#/a/' + encodeURIComponent(article.id), label: 'Open' } });
       if (/^#?\/?$/.test(location.hash)) route(); // the library list is showing: refresh it
     } catch (e) {
-      if (e instanceof AuthError) return showLogin('Token rejected, enter it again.');
+      if (e instanceof AuthError) return showLogin(e.message);
       toast('Could not save ' + (host(url) || url) + ': ' + e.message, { error: true });
     }
   }
@@ -653,6 +683,7 @@
     hidePop();
     if (!isConfigured()) return showLogin();
     $nav.hidden = false;
+    $logout.hidden = !IN_APP && tokenless && !getToken(); // nothing to sign out of without a token
     const parts = location.hash.replace(/^#\/?/, '').split('/');
     try {
       if (parts[0] === 'settings' && IN_APP) showSetup({ settings: true });
@@ -662,7 +693,7 @@
       else await libraryView(my);
     } catch (e) {
       if (my !== nav) return;
-      if (e instanceof AuthError) return showLogin('Token rejected, enter it again.');
+      if (e instanceof AuthError) return showLogin(e.message);
       show(h('p', null, h('a', { href: '#/' }, '← Library')), errorNode(e));
     }
   }
@@ -681,6 +712,7 @@
 
   (async () => {
     await loadConfig();
+    await probeTailscale();
     await route();
     if (IN_APP) {
       openExternally();

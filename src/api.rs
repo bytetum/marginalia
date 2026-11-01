@@ -1,10 +1,11 @@
 //! REST access layer. Thin: every handler parses input, calls `App`, and serialises the result.
-//! The MCP server is mounted at `/mcp` behind the same bearer-token middleware.
+//! The MCP server is mounted at `/mcp` behind the same auth middleware (bearer token, or a trusted Tailscale login).
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -48,25 +49,62 @@ fn cors() -> CorsLayer {
         .max_age(std::time::Duration::from_secs(600))
 }
 
+/// How requests are authenticated. `token` is the static bearer token (`None` = open). `tailscale_logins` are the
+/// `Tailscale-User-Login` values trusted as the owner: a request carrying one of them needs no token. Only pass them
+/// when the listener is a Unix socket that nobody but the owner and tailscaled can open; over TCP any local account
+/// could forge the header, so the TCP path passes an empty list.
+#[derive(Clone, Default)]
+pub struct Auth {
+    pub token: Option<String>,
+    pub tailscale_logins: Vec<String>,
+}
+
+/// `Auth` as the middleware and `/save` use it: the token shared, logins trimmed and lower-cased (blanks dropped).
+#[derive(Clone)]
+struct AuthState {
+    token: Option<Arc<str>>,
+    logins: Arc<[String]>,
+}
+
+impl From<Auth> for AuthState {
+    fn from(auth: Auth) -> Self {
+        let logins =
+            auth.tailscale_logins.iter().map(|l| l.trim().to_ascii_lowercase()).filter(|l| !l.is_empty()).collect();
+        Self { token: auth.token.map(Arc::from), logins }
+    }
+}
+
+/// How a request got in; the middleware stores it as a request extension and `GET /me` reports it.
+#[derive(Clone)]
+enum Granted {
+    /// No token is configured.
+    Open,
+    Token,
+    Tailscale(String),
+}
+
+/// Set by tailscaled on requests from personal (untagged) devices; it removes any client-sent copy.
+const TAILSCALE_LOGIN: HeaderName = HeaderName::from_static("tailscale-user-login");
+
 #[derive(Clone)]
 struct SaveState {
     app: Arc<App>,
-    token: Option<Arc<str>>,
+    auth: AuthState,
 }
 
-/// REST routes, the web page, and the MCP endpoint at `/mcp`. With `token` set, everything except `GET /health`,
-/// the static page files and `GET /save` (which checks `?token=` itself) needs `Authorization: Bearer <token>`.
-/// CORS is open to the app's own origins only (see `APP_ORIGINS`).
-pub fn router(app: Arc<App>, token: Option<String>) -> Router {
-    let token: Option<Arc<str>> = token.map(Arc::from);
-    let save = Router::new()
-        .route("/save", get(save_link))
-        .with_state(SaveState { app: app.clone(), token: token.clone() });
+/// REST routes, the web page, and the MCP endpoint at `/mcp`. With a token set, everything except `GET /health`,
+/// the static page files and `GET /save` (which checks `?token=` itself) needs `Authorization: Bearer <token>` or a
+/// trusted `Tailscale-User-Login` (see `Auth`). CORS is open to the app's own origins only (see `APP_ORIGINS`).
+pub fn router(app: Arc<App>, auth: Auth) -> Router {
+    let auth = AuthState::from(auth);
+    let save =
+        Router::new().route("/save", get(save_link)).with_state(SaveState { app: app.clone(), auth: auth.clone() });
     Router::new()
         .route("/", get(index_page))
         .route("/app.js", get(app_js))
         .route("/app.css", get(app_css))
         .route("/health", get(health))
+        .route("/me", get(me))
         .route("/articles", get(list_articles).post(save_article))
         .route("/articles/{id}", get(get_article).delete(delete_article))
         .route("/articles/{id}/html", get(article_html))
@@ -84,31 +122,69 @@ pub fn router(app: Arc<App>, token: Option<String>) -> Router {
         .with_state(app.clone())
         .merge(save)
         .nest_service("/mcp", mcp::http_service(app))
-        .layer(middleware::from_fn_with_state(token, require_bearer))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
         // Outermost, so a preflight (which carries no Authorization header) is answered before the token check.
         .layer(cors())
 }
 
 // ---------- auth ----------
 
-async fn require_bearer(State(token): State<Option<Arc<str>>>, req: Request, next: Next) -> Response {
-    let Some(token) = token else { return next.run(req).await };
+async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Next) -> Response {
+    if auth.token.is_none() {
+        req.extensions_mut().insert(Granted::Open);
+        return next.run(req).await;
+    }
     if req.method() == Method::GET && is_public(req.uri().path()) {
         return next.run(req).await;
     }
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(p) if constant_time_eq(p.as_bytes(), token.as_bytes()) => next.run(req).await,
-        _ => {
-            let mut res = (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid bearer token" }))).into_response();
+    match authorize(&auth, req.headers()) {
+        // The Tailscale login is an ambient credential, which a bearer token is not: a page on another site could make
+        // the owner's browser send it. Browsers label such requests, so refuse the cross-site ones that change state.
+        Some(Granted::Tailscale(_)) if !req.method().is_safe() && is_cross_site(req.headers()) => {
+            (StatusCode::FORBIDDEN, Json(json!({ "error": "cross-site request refused; use the bearer token" })))
+                .into_response()
+        }
+        Some(granted) => {
+            req.extensions_mut().insert(granted);
+            next.run(req).await
+        }
+        None => {
+            let mut res =
+                (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid bearer token" }))).into_response();
             res.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
             res
         }
     }
+}
+
+/// A valid bearer token always works; failing that, a trusted Tailscale login. Call only with a token configured.
+fn authorize(auth: &AuthState, headers: &HeaderMap) -> Option<Granted> {
+    let token = auth.token.as_deref()?;
+    let presented =
+        headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
+        return Some(Granted::Token);
+    }
+    tailscale_login(auth, headers).map(Granted::Tailscale)
+}
+
+/// The `Tailscale-User-Login` value if it is exactly one header and names one of the trusted logins (ASCII
+/// case-insensitive, trimmed). Always `None` with no trusted logins.
+fn tailscale_login(auth: &AuthState, headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(TAILSCALE_LOGIN).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let login = value.to_str().ok()?.trim();
+    auth.logins.iter().any(|l| l.eq_ignore_ascii_case(login)).then(|| login.to_string())
+}
+
+/// A browser says `Sec-Fetch-Site: cross-site` (or `same-site`, another host under the same domain) when a page from
+/// elsewhere sent the request. The app's own origins are the exception: its webview is a different origin by design.
+fn is_cross_site(headers: &HeaderMap) -> bool {
+    let from = |name: HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    matches!(from(HeaderName::from_static("sec-fetch-site")), Some("cross-site" | "same-site"))
+        && !from(header::ORIGIN).is_some_and(|o| APP_ORIGINS.contains(&o))
 }
 
 /// Compares every byte of the longer input, so timing does not reveal how much of a guess matched.
@@ -195,6 +271,15 @@ struct Health {
 
 async fn health(State(app): Shared) -> Json<Health> {
     Json(Health { ok: true, llm: app.has_llm() })
+}
+
+/// Who the caller is, so a client can tell whether it is already signed in without sending a token.
+async fn me(Extension(granted): Extension<Granted>) -> Json<serde_json::Value> {
+    Json(match granted {
+        Granted::Open => json!({ "auth": "none", "login": null }),
+        Granted::Token => json!({ "auth": "token", "login": null }),
+        Granted::Tailscale(login) => json!({ "auth": "tailscale", "login": login }),
+    })
 }
 
 #[derive(Deserialize)]
@@ -408,12 +493,15 @@ struct SaveLink {
 }
 
 /// `GET /save?url=<u>&token=<t>`: saves the page, then redirects (303) to the reader. This is the only route that
-/// takes the token in the query string. With a token configured it is always required, and the response never
-/// echoes it. Failures are small HTML pages because the browser is navigating here.
-async fn save_link(State(state): State<SaveState>, Params(q): Params<SaveLink>) -> Response {
-    if let Some(expected) = &state.token {
+/// takes the token in the query string. With a token configured it is required unless the request carries a trusted
+/// `Tailscale-User-Login` (a device signed in as the owner needs no token), and the response never echoes it.
+/// Failures are small HTML pages because the browser is navigating here.
+async fn save_link(State(state): State<SaveState>, headers: HeaderMap, Params(q): Params<SaveLink>) -> Response {
+    if let Some(expected) = &state.auth.token {
         let presented = q.token.as_deref().unwrap_or("");
-        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        if !constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            && tailscale_login(&state.auth, &headers).is_none()
+        {
             return save_page(StatusCode::UNAUTHORIZED, "Missing or invalid token.");
         }
     }

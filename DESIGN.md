@@ -12,13 +12,13 @@ Easy access (REST + our MCP) · Synthesis products served to others.
 | Database | SurrealDB 3, embedded (`surrealkv`), behind `Repo` |
 | Agent | Both: our MCP + skill for external harnesses, and a built-in loop for synthesis products |
 | Steering | Optional one-line `direction` given up front; the run then completes and saves |
-| Access | Bind to a configurable address (Tailscale/LAN), static bearer token on REST and MCP HTTP |
+| Access | Bind to a configurable address (Tailscale/LAN), static bearer token on REST and MCP HTTP; optionally a Unix socket where the `Tailscale-User-Login` header of trusted logins replaces the token (never trusted on TCP, where any local account could forge it) |
 | MCP transports | Streamable HTTP at `/mcp` (same server as REST) **and** `marginalia mcp` over stdio |
 | Search | Keyword only (SurrealDB full-text, BM25); vectors later behind the same `search()` |
 | MCP scope | Read + add: read/search articles, highlights, syntheses; save_url; add_highlight; save_synthesis. No deletes |
 | Built-in runs via MCP | Yes: `analyse_article` and `write_brief` tools call the built-in loop |
-| Web page | Static `web/` files embedded in the binary, served at `/` without auth; data via the REST API with a bearer token in localStorage. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html` |
-| Quick save | `GET /save?url=&token=` (token in the query only on this route, constant-time check) saves then 303s to `/#/a/<id>`; iOS Shortcut / Android use `POST /articles` |
+| Web page | Static `web/` files embedded in the binary, served at `/` without auth; data via the REST API with a bearer token in localStorage, or none when `GET /me` shows the device is recognised via Tailscale. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html` |
+| Quick save | `GET /save?url=&token=` (token in the query only on this route, constant-time check; a trusted Tailscale login needs no token) saves then 303s to `/#/a/<id>`; iOS Shortcut / Android use `POST /articles` |
 | Deploy | systemd user service `marginalia` (linger already on), bound to Tailscale `100.103.153.13`, token in an env file |
 
 ## Architecture (ports and adapters)

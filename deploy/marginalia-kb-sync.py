@@ -10,7 +10,7 @@ is missing: it never duplicates, edits or deletes, and nodes moved, edited or de
 Ids already copied are remembered in STATE_FILE (one line per kb node id), so a run with nothing new makes no kb calls;
 delete that file to re-check every node against kb.
 
-Reads MARGINALIA_BIND / MARGINALIA_TOKEN from ~/.config/marginalia/env (or the environment); writes with the kb CLI to
+Reads MARGINALIA_URL (else MARGINALIA_BIND) / MARGINALIA_TOKEN from ~/.config/marginalia/env (or the environment); writes with the kb CLI to
 KB_ROOT (default: the kb home store, ~/.local/share/kb/home).
 """
 
@@ -82,8 +82,9 @@ def remember(done: set, node_id: str) -> None:
 
 
 def main() -> int:
+    # MARGINALIA_URL (e.g. the HTTPS Tailscale Service address) wins; reader links point there too.
     bind = env("MARGINALIA_BIND", "127.0.0.1:7878").replace("0.0.0.0", "127.0.0.1")
-    base = f"http://{bind}"
+    base = env("MARGINALIA_URL", f"http://{bind}").rstrip("/")
     req = urllib.request.Request(f"{base}/export", headers={"Authorization": f"Bearer {env('MARGINALIA_TOKEN')}"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         library = json.load(resp)

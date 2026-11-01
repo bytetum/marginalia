@@ -19,6 +19,15 @@ use tower::ServiceExt as _;
 
 const TOKEN: &str = "s3cret";
 
+fn token_auth() -> api::Auth {
+    api::Auth { token: Some(TOKEN.into()), tailscale_logins: vec![] }
+}
+
+/// The router as served on a Unix socket: the token plus the owner's Tailscale login.
+fn tailscale_auth() -> api::Auth {
+    api::Auth { token: Some(TOKEN.into()), tailscale_logins: vec!["Owner@GitHub".into(), " other@github ".into()] }
+}
+
 fn app() -> (Arc<App>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let app = App::new(Arc::new(MemRepo::new()), Arc::new(FsBlobStore::new(dir.path().join("blobs"))), AppConfig::default());
@@ -60,7 +69,7 @@ async fn save_sample(router: &Router) -> String {
 #[tokio::test]
 async fn bearer_token_is_enforced_except_health() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
 
     let (status, body) = call(&router, "GET", "/articles", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -80,14 +89,14 @@ async fn bearer_token_is_enforced_except_health() {
 #[tokio::test]
 async fn no_token_means_open() {
     let (app, _dir) = app();
-    let router = api::router(app, None);
+    let router = api::router(app, api::Auth::default());
     assert_eq!(call(&router, "GET", "/articles", None, None).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn article_lifecycle() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
     let id = save_sample(&router).await;
 
     let (status, article) = call(&router, "GET", &format!("/articles/{id}"), Some(TOKEN), None).await;
@@ -122,7 +131,7 @@ async fn article_lifecycle() {
 #[tokio::test]
 async fn errors_map_to_statuses() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
 
     let (status, body) = call(&router, "GET", "/articles/nope", Some(TOKEN), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -172,7 +181,7 @@ async fn syntheses_are_listed_and_filtered() {
         })
         .await
         .expect("save");
-    let router = api::router(app, None);
+    let router = api::router(app, api::Auth::default());
     let (_, all) = call(&router, "GET", "/syntheses", None, None).await;
     assert_eq!(all.as_array().map(Vec::len), Some(1));
     assert_eq!(call(&router, "GET", "/syntheses?kind=analysis", None, None).await.1, json!([]));
@@ -267,7 +276,7 @@ async fn mcp_tools_over_in_process_transport() {
 #[tokio::test]
 async fn export_needs_the_token_and_returns_the_whole_library() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
 
     let (status, body) = call(&router, "GET", "/export", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -317,7 +326,7 @@ fn hv<'a>(res: &'a axum::http::Response<Body>, name: &str) -> Option<&'a str> {
 #[tokio::test]
 async fn cors_allows_the_app_origins_to_preflight_without_a_token() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
 
     for origin in ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"] {
         for method in ["GET", "POST", "DELETE"] {
@@ -343,7 +352,7 @@ async fn cors_allows_the_app_origins_to_preflight_without_a_token() {
 #[tokio::test]
 async fn cors_answers_real_requests_for_the_app_including_401() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
     let origin = "tauri://localhost";
 
     let res = with_origin(&router, "GET", "/health", origin, &[]).await;
@@ -364,9 +373,16 @@ async fn cors_answers_real_requests_for_the_app_including_401() {
 #[tokio::test]
 async fn cors_refuses_every_other_origin() {
     let (app, _dir) = app();
-    let router = api::router(app, Some(TOKEN.into()));
+    let router = api::router(app, token_auth());
 
-    for origin in ["https://evil.example", "http://localhost", "http://localhost:1420", "tauri://localhost.evil.example", "null", "https://marginalia-bytetum.taild98079.ts.net"] {
+    for origin in [
+        "https://evil.example",
+        "http://localhost",
+        "http://localhost:1420",
+        "tauri://localhost.evil.example",
+        "null",
+        "https://marginalia-bytetum.taild98079.ts.net",
+    ] {
         let pre = with_origin(
             &router,
             "OPTIONS",
@@ -384,4 +400,122 @@ async fn cors_refuses_every_other_origin() {
     let req = Request::builder().method("GET").uri("/health").body(Body::empty()).expect("request");
     let res = router.clone().oneshot(req).await.expect("response");
     assert_eq!(hv(&res, "access-control-allow-origin"), None);
+}
+
+/// `call` with arbitrary request headers and no body.
+async fn call_with(router: &Router, method: &str, uri: &str, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = router.clone().oneshot(req.body(Body::empty()).expect("request")).await.expect("response");
+    let status = res.status();
+    let bytes = res.into_body().collect().await.expect("body").to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+const LOGIN: &str = "tailscale-user-login";
+
+#[tokio::test]
+async fn trusted_tailscale_login_needs_no_token() {
+    let (app, _dir) = app();
+    let router = api::router(app, tailscale_auth());
+
+    for login in ["owner@github", "OWNER@github", "  owner@GITHUB ", "other@github"] {
+        let (status, body) = call_with(&router, "GET", "/articles", &[(LOGIN, login)]).await;
+        assert_eq!((status, body), (StatusCode::OK, json!([])), "{login:?}");
+    }
+    // MCP sits behind the same check: it gets past auth (what the MCP layer answers to an empty body is not our business).
+    let (status, _) = call_with(&router, "POST", "/mcp", &[(LOGIN, "owner@github")]).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+    // Anyone else, a partial match, an empty value, or a token-less request stays out.
+    for login in ["intruder@github", "owner@githu", "owner@github.evil", "", "owner@github,other@github"] {
+        let (status, _) = call_with(&router, "GET", "/articles", &[(LOGIN, login)]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{login:?}");
+    }
+    assert_eq!(call(&router, "GET", "/articles", None, None).await.0, StatusCode::UNAUTHORIZED);
+    // Two copies of the header are ambiguous, so neither is trusted.
+    let (status, _) = call_with(&router, "GET", "/articles", &[(LOGIN, "owner@github"), (LOGIN, "owner@github")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The bearer token keeps working next to it, and a wrong one is not rescued by nothing.
+    assert_eq!(call(&router, "GET", "/articles", Some(TOKEN), None).await.0, StatusCode::OK);
+    assert_eq!(call(&router, "GET", "/articles", Some("wrong"), None).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn tailscale_header_is_ignored_when_no_logins_are_configured() {
+    // What the TCP listener builds: any local account can send this header there, so it must count for nothing.
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+    let (status, _) = call_with(&router, "GET", "/articles", &[(LOGIN, "owner@github")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call_with(&router, "GET", "/me", &[(LOGIN, "owner@github")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call_with(&router, "GET", "/save?url=https://example.com", &[(LOGIN, "owner@github")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Blank logins never match an empty header either.
+    let (blank_app, _dir2) = self::app();
+    let blank = api::Auth { token: Some(TOKEN.into()), tailscale_logins: vec!["".into(), "  ".into()] };
+    let router = api::router(blank_app, blank);
+    assert_eq!(call_with(&router, "GET", "/articles", &[(LOGIN, "")]).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn save_link_accepts_a_trusted_login_instead_of_the_token() {
+    let (app, _dir) = app();
+    let router = api::router(app, tailscale_auth());
+    // Past auth means the missing `url` is what it complains about (400); no LLM or network is needed.
+    assert_eq!(call_with(&router, "GET", "/save", &[(LOGIN, "owner@github")]).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call_with(&router, "GET", "/save", &[(LOGIN, "intruder@github")]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(call_with(&router, "GET", "/save", &[]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(call_with(&router, "GET", "/save?token=s3cret", &[]).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn me_reports_how_the_caller_got_in() {
+    let (app, _dir) = app();
+    let router = api::router(app, tailscale_auth());
+    assert_eq!(call(&router, "GET", "/me", None, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        call(&router, "GET", "/me", Some(TOKEN), None).await,
+        (StatusCode::OK, json!({ "auth": "token", "login": null }))
+    );
+    assert_eq!(
+        call_with(&router, "GET", "/me", &[(LOGIN, " owner@github ")]).await,
+        (StatusCode::OK, json!({ "auth": "tailscale", "login": "owner@github" }))
+    );
+    // A valid token wins over a login header.
+    let both = [("authorization", "Bearer s3cret"), (LOGIN, "owner@github")];
+    assert_eq!(
+        call_with(&router, "GET", "/me", &both).await,
+        (StatusCode::OK, json!({ "auth": "token", "login": null }))
+    );
+
+    let (open_app, _dir2) = self::app();
+    let open = api::router(open_app, api::Auth::default());
+    assert_eq!(call(&open, "GET", "/me", None, None).await, (StatusCode::OK, json!({ "auth": "none", "login": null })));
+}
+
+#[tokio::test]
+async fn tailscale_login_cannot_be_used_by_cross_site_writes() {
+    let (app, _dir) = app();
+    let router = api::router(app, tailscale_auth());
+    let site = |v| [(LOGIN, "owner@github"), ("sec-fetch-site", v)];
+    // A page elsewhere could make the owner's browser send the header, so it cannot write...
+    for v in ["cross-site", "same-site"] {
+        assert_eq!(call_with(&router, "POST", "/briefs", &site(v)).await.0, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(call_with(&router, "DELETE", "/articles/x", &site(v)).await.0, StatusCode::FORBIDDEN, "{v}");
+    }
+    // ...but the page itself, the app's webview, and non-browser clients (no Sec-Fetch-Site) can.
+    assert_ne!(call_with(&router, "POST", "/briefs", &site("same-origin")).await.0, StatusCode::FORBIDDEN);
+    assert_ne!(call_with(&router, "POST", "/briefs", &site("none")).await.0, StatusCode::FORBIDDEN);
+    assert_ne!(call_with(&router, "POST", "/briefs", &[(LOGIN, "owner@github")]).await.0, StatusCode::FORBIDDEN);
+    let app_origin = [(LOGIN, "owner@github"), ("sec-fetch-site", "cross-site"), ("origin", "tauri://localhost")];
+    assert_ne!(call_with(&router, "POST", "/briefs", &app_origin).await.0, StatusCode::FORBIDDEN);
+    // Cross-site reads are not blocked here (CORS stops the page reading the answer) and the token is never ambient.
+    assert_eq!(call_with(&router, "GET", "/articles", &site("cross-site")).await.0, StatusCode::OK);
+    let token = [("authorization", "Bearer s3cret"), ("sec-fetch-site", "cross-site")];
+    assert_ne!(call_with(&router, "POST", "/briefs", &token).await.0, StatusCode::FORBIDDEN);
 }
