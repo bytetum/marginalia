@@ -462,17 +462,16 @@
   async function readerView(id, my) {
     show(h('p', { class: 'muted' }, 'Loading...'));
     const q = encodeURIComponent(id);
-    // All three start at once; a book has no /html, so that request is dropped when the article turns out to be one.
-    const htmlReq = api('/articles/' + q + '/html');
+    // The metadata (without the body, which for a book runs to megabytes) decides the view; the highlights load
+    // meanwhile. Only a web article then asks for its rendered HTML: a book is read from its EPUB.
     const hlReq = api('/articles/' + q + '/highlights');
-    const article = await api('/articles/' + q).catch((e) => { htmlReq.catch(() => {}); hlReq.catch(() => {}); throw e; });
+    const article = await api('/articles/' + q + '?body=false').catch((e) => { hlReq.catch(() => {}); throw e; });
     if (article.kind === 'book') {
-      htmlReq.catch(() => {});
       const highlights = await hlReq;
       if (my !== nav) return;
       return bookView(article, highlights, my);
     }
-    const [html, highlights] = await Promise.all([htmlReq, hlReq]);
+    const [html, highlights] = await Promise.all([api('/articles/' + q + '/html'), hlReq]);
     if (my !== nav) return;
 
     const body = h('div', { class: 'article' });

@@ -319,12 +319,19 @@ async fn save_article(State(app): Shared, Body(b): Body<SaveArticle>) -> Result<
     Ok((StatusCode::CREATED, Json(article)))
 }
 
-async fn get_article(State(app): Shared, Path(id): Path<String>) -> ApiResult<Article> {
-    app.repo()
-        .get_article(&id)
-        .await?
-        .map(Json)
-        .ok_or_else(|| AppError::NotFound(format!("no article with id {id}")).into())
+#[derive(Deserialize)]
+struct ArticleQuery {
+    /// `false` leaves `markdown` empty: the web page only needs the metadata, and a book's text runs to megabytes.
+    body: Option<bool>,
+}
+
+async fn get_article(State(app): Shared, Path(id): Path<String>, Params(q): Params<ArticleQuery>) -> ApiResult<Article> {
+    let mut article =
+        app.repo().get_article(&id).await?.ok_or_else(|| AppError::NotFound(format!("no article with id {id}")))?;
+    if q.body == Some(false) {
+        article.markdown.clear();
+    }
+    Ok(Json(article))
 }
 
 async fn delete_article(State(app): Shared, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
@@ -554,6 +561,10 @@ async fn article_html(State(app): Shared, Path(id): Path<String>) -> Result<Html
         .get_article(&id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no article with id {id}")))?;
+    // A book is read from its EPUB (`/articles/{id}/file`); rendering the whole text here would be megabytes of HTML.
+    if article.kind == "book" {
+        return Err(AppError::NotFound(format!("{id} is a book: read it from /articles/{id}/file")).into());
+    }
     Ok(Html(markdown_to_html(&article.markdown)))
 }
 

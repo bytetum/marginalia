@@ -614,6 +614,11 @@ async fn uploading_a_book_creates_dedups_serves_the_file_and_rejects_non_epubs()
     assert!(md.starts_with("## Sleeping\n\nOtters hold hands while they sleep."), "{md}");
     assert!(md.contains("## Eating\n\nOtters crack clams"), "{md}");
 
+    // The page asks for the metadata only, and a book has no rendered-HTML view (it is read from its EPUB).
+    let (_, meta) = call(&router, "GET", &format!("/articles/{id}?body=false"), Some(TOKEN), None).await;
+    assert_eq!((meta["kind"].as_str(), meta["markdown"].as_str()), (Some("book"), Some("")));
+    assert_eq!(call(&router, "GET", &format!("/articles/{id}/html"), Some(TOKEN), None).await.0, StatusCode::NOT_FOUND);
+
     // The original bytes come back, cacheable forever, behind the token.
     let uri = format!("/articles/{id}/file");
     assert_eq!(raw(&router, "GET", &uri, &[], vec![]).await.0, StatusCode::UNAUTHORIZED);
