@@ -59,6 +59,8 @@ DEFINE FIELD IF NOT EXISTS words ON article TYPE int;
 DEFINE FIELD IF NOT EXISTS via ON article TYPE string;
 DEFINE FIELD IF NOT EXISTS blob_key ON article TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS saved_at ON article TYPE datetime;
+DEFINE FIELD IF NOT EXISTS kind ON article TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS author ON article TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS article_url ON article FIELDS url UNIQUE;
 DEFINE INDEX IF NOT EXISTS article_saved_at ON article FIELDS saved_at;
 DEFINE INDEX IF NOT EXISTS article_title_ft ON article FIELDS title FULLTEXT ANALYZER marginalia_text BM25;
@@ -69,6 +71,8 @@ DEFINE FIELD IF NOT EXISTS article_id ON highlight TYPE string;
 DEFINE FIELD IF NOT EXISTS text ON highlight TYPE string;
 DEFINE FIELD IF NOT EXISTS note ON highlight TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON highlight TYPE datetime;
+DEFINE FIELD IF NOT EXISTS anchor ON highlight TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS location ON highlight TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS highlight_article ON highlight FIELDS article_id;
 DEFINE INDEX IF NOT EXISTS highlight_created_at ON highlight FIELDS created_at;
 DEFINE INDEX IF NOT EXISTS highlight_text_ft ON highlight FIELDS text FULLTEXT ANALYZER marginalia_text BM25;
@@ -82,14 +86,20 @@ DEFINE FIELD IF NOT EXISTS article_ids ON synthesis TYPE array<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON synthesis TYPE datetime;
 DEFINE INDEX IF NOT EXISTS synthesis_created_at ON synthesis FIELDS created_at;
 
+DEFINE TABLE IF NOT EXISTS progress SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS position ON progress TYPE string;
+DEFINE FIELD IF NOT EXISTS fraction ON progress TYPE float;
+DEFINE FIELD IF NOT EXISTS updated_at ON progress TYPE datetime;
+
 DEFINE TABLE IF NOT EXISTS usage SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS kind ON usage TYPE string;
 DEFINE FIELD IF NOT EXISTS detail ON usage TYPE any;
 DEFINE FIELD IF NOT EXISTS at ON usage TYPE datetime;
 ";
 
-const ARTICLE_COLS: &str = "record::id(id) AS id, url, title, markdown, words, via, blob_key, saved_at";
-const HIGHLIGHT_COLS: &str = "record::id(id) AS id, article_id, text, note, created_at";
+const ARTICLE_COLS: &str = "record::id(id) AS id, url, title, markdown, words, via, blob_key, saved_at, kind, author";
+const HIGHLIGHT_COLS: &str = "record::id(id) AS id, article_id, text, note, created_at, anchor, location";
+const PROGRESS_COLS: &str = "record::id(id) AS article_id, position, fraction, updated_at";
 const SYNTHESIS_COLS: &str = "record::id(id) AS id, kind, title, direction, body, article_ids, created_at";
 
 // ---------------------------------------------------------------------------------------------
@@ -106,6 +116,8 @@ struct ArticleDoc {
     via: String,
     blob_key: Option<String>,
     saved_at: DateTime<Utc>,
+    kind: Option<String>,
+    author: Option<String>,
 }
 
 #[derive(Debug, SurrealValue)]
@@ -118,6 +130,8 @@ struct ArticleRow {
     via: String,
     blob_key: Option<String>,
     saved_at: DateTime<Utc>,
+    kind: Option<String>,
+    author: Option<String>,
 }
 
 #[derive(Debug, SurrealValue)]
@@ -128,6 +142,8 @@ struct SummaryRow {
     words: i64,
     via: String,
     saved_at: DateTime<Utc>,
+    kind: Option<String>,
+    author: Option<String>,
 }
 
 #[derive(Debug, SurrealValue)]
@@ -142,6 +158,8 @@ struct HighlightDoc {
     text: String,
     note: Option<String>,
     created_at: DateTime<Utc>,
+    anchor: Option<String>,
+    location: Option<String>,
 }
 
 #[derive(Debug, SurrealValue)]
@@ -151,6 +169,24 @@ struct HighlightRow {
     text: String,
     note: Option<String>,
     created_at: DateTime<Utc>,
+    anchor: Option<String>,
+    location: Option<String>,
+}
+
+#[derive(Debug, SurrealValue)]
+struct ProgressDoc {
+    position: String,
+    fraction: f64,
+    updated_at: DateTime<Utc>,
+}
+
+/// The record key is the article id.
+#[derive(Debug, SurrealValue)]
+struct ProgressRow {
+    article_id: String,
+    position: String,
+    fraction: f64,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, SurrealValue)]
@@ -225,7 +261,15 @@ impl From<ArticleRow> for Article {
             via: r.via,
             blob_key: r.blob_key,
             saved_at: r.saved_at,
+            kind: r.kind.unwrap_or_else(|| KIND_WEB.into()),
+            author: r.author,
         }
+    }
+}
+
+impl From<ProgressRow> for Progress {
+    fn from(r: ProgressRow) -> Self {
+        Progress { article_id: r.article_id, position: r.position, fraction: r.fraction, updated_at: r.updated_at }
     }
 }
 
@@ -237,6 +281,8 @@ impl From<HighlightRow> for Highlight {
             text: r.text,
             note: r.note,
             created_at: r.created_at,
+            anchor: r.anchor,
+            location: r.location,
         }
     }
 }
@@ -348,6 +394,8 @@ impl Repo for SurrealRepo {
             via: new.via,
             blob_key: new.blob_key,
             saved_at: Utc::now(),
+            kind: Some(new.kind),
+            author: new.author,
         };
 
         let mut res = self
@@ -368,6 +416,8 @@ impl Repo for SurrealRepo {
             via: doc.via.clone(),
             blob_key: doc.blob_key.clone(),
             saved_at: doc.saved_at,
+            kind: doc.kind.clone().unwrap_or_else(|| KIND_WEB.into()),
+            author: doc.author.clone(),
         };
         // UPSERT ... CONTENT creates or replaces the whole record under the same key.
         self.db
@@ -393,11 +443,18 @@ impl Repo for SurrealRepo {
         Ok(rows.into_iter().next().map(Article::from))
     }
 
+    async fn get_article_by_url(&self, url: &str) -> RepoResult<Option<Article>> {
+        let sql = format!("SELECT {ARTICLE_COLS} FROM article WHERE url = $url LIMIT 1");
+        let mut res = self.db.query(sql).bind(("url", url.to_string())).await.map_err(backend)?;
+        let rows: Vec<ArticleRow> = res.take(0).map_err(backend)?;
+        Ok(rows.into_iter().next().map(Article::from))
+    }
+
     async fn list_articles(&self, limit: u32, offset: u32) -> RepoResult<Vec<ArticleSummary>> {
         let mut res = self
             .db
             .query(
-                "SELECT record::id(id) AS id, url, title, words, via, saved_at FROM article \
+                "SELECT record::id(id) AS id, url, title, words, via, saved_at, kind, author FROM article \
                  ORDER BY saved_at DESC LIMIT $limit START $offset",
             )
             .bind(("limit", i64::from(limit)))
@@ -422,16 +479,29 @@ impl Repo for SurrealRepo {
         let counts: Vec<CountRow> = res.take(0).map_err(backend)?;
         let counts: HashMap<String, i64> = counts.into_iter().map(|c| (c.article_id, c.n)).collect();
 
+        let recs: Vec<RecordId> = rows.iter().map(|r| record("progress", &r.id)).collect();
+        let mut res = self
+            .db
+            .query(format!("SELECT {PROGRESS_COLS} FROM $recs"))
+            .bind(("recs", recs))
+            .await
+            .map_err(backend)?;
+        let progress: Vec<ProgressRow> = res.take(0).map_err(backend)?;
+        let progress: HashMap<String, f64> = progress.into_iter().map(|p| (p.article_id, p.fraction)).collect();
+
         Ok(rows
             .into_iter()
             .map(|r| ArticleSummary {
                 highlight_count: to_u32(counts.get(&r.id).copied().unwrap_or(0)),
+                progress: progress.get(&r.id).copied(),
                 id: r.id,
                 url: r.url,
                 title: r.title,
                 words: to_u32(r.words),
                 via: r.via,
                 saved_at: r.saved_at,
+                kind: r.kind.unwrap_or_else(|| KIND_WEB.into()),
+                author: r.author,
             })
             .collect())
     }
@@ -445,6 +515,7 @@ impl Repo for SurrealRepo {
             .query(
                 "BEGIN; \
                  DELETE highlight WHERE article_id = $id; \
+                 DELETE type::record('progress', $id); \
                  DELETE type::record('article', $id); \
                  COMMIT;",
             )
@@ -471,12 +542,16 @@ impl Repo for SurrealRepo {
             text: new.text,
             note: new.note,
             created_at: Utc::now(),
+            anchor: new.anchor,
+            location: new.location,
         };
         let doc = HighlightDoc {
             article_id: highlight.article_id.clone(),
             text: highlight.text.clone(),
             note: highlight.note.clone(),
             created_at: highlight.created_at,
+            anchor: highlight.anchor.clone(),
+            location: highlight.location.clone(),
         };
         self.db
             .query("CREATE type::record('highlight', $id) CONTENT $doc")
@@ -487,6 +562,47 @@ impl Repo for SurrealRepo {
             .check()
             .map_err(backend)?;
         Ok(highlight)
+    }
+
+    async fn get_progress(&self, article_id: &str) -> RepoResult<Option<Progress>> {
+        let mut res = self
+            .db
+            .query(format!("SELECT {PROGRESS_COLS} FROM type::record('progress', $id)"))
+            .bind(("id", article_id.to_string()))
+            .await
+            .map_err(backend)?;
+        let rows: Vec<ProgressRow> = res.take(0).map_err(backend)?;
+        Ok(rows.into_iter().next().map(Progress::from))
+    }
+
+    async fn put_progress(&self, article_id: &str, position: &str, fraction: f64) -> RepoResult<Progress> {
+        if position.trim().is_empty() {
+            return Err(RepoError::Invalid("progress position is blank".into()));
+        }
+        let _guard = self.write.lock().await;
+        if !self.article_exists(article_id).await? {
+            return Err(RepoError::NotFound(format!("article {article_id}")));
+        }
+        let progress = Progress {
+            article_id: article_id.into(),
+            position: position.into(),
+            fraction: repo::clamp_fraction(fraction),
+            updated_at: Utc::now(),
+        };
+        let doc = ProgressDoc {
+            position: progress.position.clone(),
+            fraction: progress.fraction,
+            updated_at: progress.updated_at,
+        };
+        self.db
+            .query("UPSERT type::record('progress', $id) CONTENT $doc")
+            .bind(("id", article_id.to_string()))
+            .bind(("doc", doc))
+            .await
+            .map_err(backend)?
+            .check()
+            .map_err(backend)?;
+        Ok(progress)
     }
 
     async fn list_highlights(&self, article_id: Option<&str>) -> RepoResult<Vec<Highlight>> {
@@ -690,17 +806,19 @@ impl Repo for SurrealRepo {
             .query(
                 "SELECT VALUE record::id(id) FROM article LIMIT 1; \
                  SELECT VALUE record::id(id) FROM highlight LIMIT 1; \
-                 SELECT VALUE record::id(id) FROM synthesis LIMIT 1;",
+                 SELECT VALUE record::id(id) FROM synthesis LIMIT 1; \
+                 SELECT VALUE record::id(id) FROM progress LIMIT 1;",
             )
             .await
             .map_err(backend)?;
-        for statement in 0..3 {
+        for statement in 0..4 {
             let rows: Vec<String> = res.take(statement).map_err(backend)?;
             if !rows.is_empty() {
                 return Err(RepoError::Invalid("restore needs an empty library, but this one already has data".into()));
             }
         }
         if export.articles.is_empty() && export.highlights.is_empty() && export.syntheses.is_empty() {
+            // Progress must point at an article, so an export without articles has none either.
             return Ok(());
         }
 
@@ -715,6 +833,9 @@ impl Repo for SurrealRepo {
         for i in 0..export.syntheses.len() {
             sql.push_str(&format!("CREATE type::record('synthesis', $si{i}) CONTENT $sd{i};\n"));
         }
+        for i in 0..export.progress.len() {
+            sql.push_str(&format!("CREATE type::record('progress', $pi{i}) CONTENT $pd{i};\n"));
+        }
         sql.push_str("COMMIT;");
 
         let mut req = self.db.query(sql);
@@ -727,11 +848,20 @@ impl Repo for SurrealRepo {
                 via: a.via.clone(),
                 blob_key: a.blob_key.clone(),
                 saved_at: a.saved_at,
+                kind: Some(a.kind.clone()),
+                author: a.author.clone(),
             };
             req = req.bind((format!("ai{i}"), a.id.clone())).bind((format!("ad{i}"), doc));
         }
         for (i, h) in export.highlights.iter().enumerate() {
-            let doc = HighlightDoc { article_id: h.article_id.clone(), text: h.text.clone(), note: h.note.clone(), created_at: h.created_at };
+            let doc = HighlightDoc {
+                article_id: h.article_id.clone(),
+                text: h.text.clone(),
+                note: h.note.clone(),
+                created_at: h.created_at,
+                anchor: h.anchor.clone(),
+                location: h.location.clone(),
+            };
             req = req.bind((format!("hi{i}"), h.id.clone())).bind((format!("hd{i}"), doc));
         }
         for (i, s) in export.syntheses.iter().enumerate() {
@@ -744,6 +874,10 @@ impl Repo for SurrealRepo {
                 created_at: s.created_at,
             };
             req = req.bind((format!("si{i}"), s.id.clone())).bind((format!("sd{i}"), doc));
+        }
+        for (i, p) in export.progress.iter().enumerate() {
+            let doc = ProgressDoc { position: p.position.clone(), fraction: p.fraction, updated_at: p.updated_at };
+            req = req.bind((format!("pi{i}"), p.article_id.clone())).bind((format!("pd{i}"), doc));
         }
         req.await.map_err(backend)?.check().map_err(backend)?;
         Ok(())

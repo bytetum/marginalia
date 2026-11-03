@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use axum::Extension;
-use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -12,10 +13,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use include_dir::{Dir, include_dir};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::domain::*;
+use crate::epub::percent_decode;
 use crate::mcp;
 use crate::render::{escape_html, markdown_to_html};
 use crate::repo::new_id;
@@ -25,14 +28,17 @@ const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SEARCH_LIMIT: u32 = 10;
 const DEFAULT_SYNTHESIS_LIMIT: u32 = 20;
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
-const APP_JS: &str = include_str!("../web/app.js");
-const APP_CSS: &str = include_str!("../web/app.css");
+/// Largest EPUB upload. Only `POST /books` gets this; every other route keeps axum's small default body limit.
+const MAX_BOOK_BYTES: usize = 200 * 1024 * 1024;
 
-/// Paths that never need the bearer token: the health check, the static web page (no data in it), and
-/// `/save`, which checks its own `?token=` because bookmarklets and share sheets cannot set headers.
+/// The whole `web/` directory, compiled into the binary (see `build.rs`, which makes new files trigger a rebuild).
+static WEB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/web");
+
+/// Paths that never need the bearer token: the health check, the static web files (no data in them: exactly the
+/// paths that exist in the embedded `web/` table), and `/save`, which checks its own `?token=` because bookmarklets
+/// and share sheets cannot set headers.
 fn is_public(path: &str) -> bool {
-    matches!(path, "/health" | "/" | "/app.js" | "/app.css" | "/save")
+    matches!(path, "/health" | "/save") || static_asset(path).is_some()
 }
 
 /// Origins the Marginalia desktop and mobile app's webview runs on: `tauri://localhost` (macOS, iOS, Linux) and
@@ -44,8 +50,8 @@ const APP_ORIGINS: [&str; 3] = ["tauri://localhost", "http://tauri.localhost", "
 fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(APP_ORIGINS.map(header::HeaderValue::from_static)))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, X_FILENAME])
         .max_age(std::time::Duration::from_secs(600))
 }
 
@@ -83,6 +89,9 @@ enum Granted {
     Tailscale(String),
 }
 
+/// Original file name of an uploaded book, URL-encoded.
+const X_FILENAME: HeaderName = HeaderName::from_static("x-filename");
+
 /// Set by tailscaled on requests from personal (untagged) devices; it removes any client-sent copy.
 const TAILSCALE_LOGIN: HeaderName = HeaderName::from_static("tailscale-user-login");
 
@@ -92,22 +101,22 @@ struct SaveState {
     auth: AuthState,
 }
 
-/// REST routes, the web page, and the MCP endpoint at `/mcp`. With a token set, everything except `GET /health`,
-/// the static page files and `GET /save` (which checks `?token=` itself) needs `Authorization: Bearer <token>` or a
+/// REST routes, the web files, and the MCP endpoint at `/mcp`. With a token set, everything except `GET /health`,
+/// the static web files and `GET /save` (which checks `?token=` itself) needs `Authorization: Bearer <token>` or a
 /// trusted `Tailscale-User-Login` (see `Auth`). CORS is open to the app's own origins only (see `APP_ORIGINS`).
 pub fn router(app: Arc<App>, auth: Auth) -> Router {
     let auth = AuthState::from(auth);
     let save =
         Router::new().route("/save", get(save_link)).with_state(SaveState { app: app.clone(), auth: auth.clone() });
     Router::new()
-        .route("/", get(index_page))
-        .route("/app.js", get(app_js))
-        .route("/app.css", get(app_css))
         .route("/health", get(health))
         .route("/me", get(me))
         .route("/articles", get(list_articles).post(save_article))
         .route("/articles/{id}", get(get_article).delete(delete_article))
+        .route("/books", post(upload_book).layer(DefaultBodyLimit::max(MAX_BOOK_BYTES)))
         .route("/articles/{id}/html", get(article_html))
+        .route("/articles/{id}/file", get(article_file))
+        .route("/articles/{id}/progress", get(get_progress).put(put_progress))
         .route("/articles/{id}/highlights", get(article_highlights).post(add_highlight))
         .route("/articles/{id}/analyse", post(analyse))
         .route("/highlights", get(all_highlights))
@@ -119,6 +128,7 @@ pub fn router(app: Arc<App>, auth: Auth) -> Router {
         .route("/syntheses/{id}", get(get_synthesis))
         .route("/syntheses/{id}/html", get(synthesis_html))
         .route("/export", get(export))
+        .fallback(static_files)
         .with_state(app.clone())
         .merge(save)
         .nest_service("/mcp", mcp::http_service(app))
@@ -330,6 +340,8 @@ async fn article_highlights(State(app): Shared, Path(id): Path<String>) -> ApiRe
 struct AddHighlight {
     text: String,
     note: Option<String>,
+    anchor: Option<String>,
+    location: Option<String>,
 }
 
 async fn add_highlight(
@@ -337,8 +349,48 @@ async fn add_highlight(
     Path(id): Path<String>,
     Body(b): Body<AddHighlight>,
 ) -> Result<(StatusCode, Json<Highlight>), ApiError> {
-    let highlight = app.add_highlight(&id, &b.text, b.note.as_deref()).await?;
+    let highlight = app.add_highlight_at(&id, &b.text, b.note.as_deref(), b.anchor.as_deref(), b.location.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(highlight)))
+}
+
+/// `POST /books`: the body is the raw EPUB. 201 for a new book, 200 with the existing one for the same bytes again.
+async fn upload_book(
+    State(app): Shared,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ArticleSummary>), ApiError> {
+    let filename = headers.get(X_FILENAME).and_then(|v| v.to_str().ok()).map(percent_decode);
+    let (summary, created) = app.save_book(Vec::from(body), filename.as_deref()).await?;
+    Ok((if created { StatusCode::CREATED } else { StatusCode::OK }, Json(summary)))
+}
+
+/// The stored EPUB. Content-addressed, so the browser may keep it forever.
+async fn article_file(State(app): Shared, Path(id): Path<String>) -> Result<Response, ApiError> {
+    let bytes = app.book_file(&id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/epub+zip"),
+            (header::CACHE_CONTROL, "private, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `null` until the reader has reported a position.
+async fn get_progress(State(app): Shared, Path(id): Path<String>) -> ApiResult<Option<Progress>> {
+    Ok(Json(app.repo().get_progress(&id).await?))
+}
+
+#[derive(Deserialize)]
+struct PutProgress {
+    position: String,
+    fraction: f64,
+}
+
+async fn put_progress(State(app): Shared, Path(id): Path<String>, Body(b): Body<PutProgress>) -> ApiResult<Progress> {
+    Ok(Json(app.repo().put_progress(&id, &b.position, b.fraction).await?))
 }
 
 async fn all_highlights(State(app): Shared) -> ApiResult<Vec<Highlight>> {
@@ -431,38 +483,68 @@ async fn export(State(app): Shared) -> ApiResult<LibraryExport> {
     Ok(Json(app.export().await?))
 }
 
-// ---------- web page ----------
+// ---------- web files ----------
 
-/// Headers for the static files. The CSP allows only our own script and style, so even a sanitiser bug in the
-/// rendered Markdown could not run script; images may come from anywhere because articles link them.
-fn static_file(content_type: &'static str, body: &'static str) -> Response {
+/// A file of the embedded `web/` directory and its content type. `/` is `index.html`. Hidden files (a segment that
+/// starts with a dot, so also `..`) and directories are never served.
+fn static_asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    let rel = if path == "/" { "index.html" } else { path.strip_prefix('/')? };
+    if rel.split('/').any(|segment| segment.is_empty() || segment.starts_with('.')) {
+        return None;
+    }
+    Some((content_type(rel), WEB.get_file(rel)?.contents()))
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).as_deref() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json" | "map") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("wasm") => "application/wasm",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Headers for the static files. The CSP keeps `script-src 'self'` (no `blob:`, no inline), so script inside an
+/// EPUB cannot run even though the reader renders each book section in a `blob:` iframe, which inherits this policy;
+/// styles, images and fonts are opened up because books carry their own. Images may come from anywhere because
+/// articles link them.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; \
+                   img-src 'self' data: blob: http: https:; font-src 'self' data: blob:; frame-src 'self' blob:; \
+                   connect-src 'self' blob:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+fn static_file(content_type: &'static str, body: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "no-cache"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: http: https:; \
-                 connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-            ),
+            (header::CONTENT_SECURITY_POLICY, CSP),
         ],
         body,
     )
         .into_response()
 }
 
-async fn index_page() -> Response {
-    static_file("text/html; charset=utf-8", INDEX_HTML)
-}
-
-async fn app_js() -> Response {
-    static_file("text/javascript; charset=utf-8", APP_JS)
-}
-
-async fn app_css() -> Response {
-    static_file("text/css; charset=utf-8", APP_CSS)
+/// Everything no route matched: a file from `web/` on GET, else 404.
+async fn static_files(req: Request) -> Response {
+    match (req.method(), static_asset(req.uri().path())) {
+        (&Method::GET, Some((content_type, body))) => static_file(content_type, body),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Sanitised HTML for the article body (see `render`). A fragment, meant for `innerHTML`.

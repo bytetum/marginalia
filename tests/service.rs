@@ -223,7 +223,7 @@ async fn agent_add_highlight_tool_writes_to_the_repo() {
     let dir = tempfile::tempdir().unwrap();
     let repo = Arc::new(MemRepo::new());
     let a = repo
-        .upsert_article(NewArticle { url: "https://x.test/a".into(), title: "Sodium".into(), markdown: "Sodium cells are cheap.".into(), via: "manual".into(), blob_key: None })
+        .upsert_article(NewArticle { url: "https://x.test/a".into(), title: "Sodium".into(), markdown: "Sodium cells are cheap.".into(), via: "manual".into(), blob_key: None, kind: KIND_WEB.into(), author: None })
         .await
         .unwrap();
     let id = a.id.clone();
@@ -413,7 +413,7 @@ async fn read_article_truncates_long_bodies_on_a_char_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let repo = Arc::new(MemRepo::new());
     let a = repo
-        .upsert_article(NewArticle { url: "https://x.test/long".into(), title: "Long".into(), markdown: long, via: "manual".into(), blob_key: None })
+        .upsert_article(NewArticle { url: "https://x.test/long".into(), title: "Long".into(), markdown: long, via: "manual".into(), blob_key: None, kind: KIND_WEB.into(), author: None })
         .await
         .unwrap();
     let id = a.id.clone();

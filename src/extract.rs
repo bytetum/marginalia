@@ -82,7 +82,7 @@ pub fn html_to_article(html: &str, url: &str) -> Result<Extracted> {
 }
 
 /// Links whose only content was an image become `[](url)` once images are skipped; drop them.
-fn strip_empty_links(markdown: &str) -> String {
+pub(crate) fn strip_empty_links(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut rest = markdown;
     while let Some(start) = rest.find("[](") {

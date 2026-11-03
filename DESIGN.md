@@ -17,7 +17,8 @@ Easy access (REST + our MCP) · Synthesis products served to others.
 | Search | Keyword only (SurrealDB full-text, BM25); vectors later behind the same `search()` |
 | MCP scope | Read + add: read/search articles, highlights, syntheses; save_url; add_highlight; save_synthesis. No deletes |
 | Built-in runs via MCP | Yes: `analyse_article` and `write_brief` tools call the built-in loop |
-| Web page | Static `web/` files embedded in the binary, served at `/` without auth; data via the REST API with a bearer token in localStorage, or none when `GET /me` shows the device is recognised via Tailscale. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html` |
+| Books | EPUB only (v1). A book is an **Article of `kind = "book"`**, not a new entity: library list, BM25 search, highlights, MCP, export and kb sync then work with no new code paths. `url = urn:sha256:<epub bytes>` is the natural key (re-upload dedups), `markdown` is the book text in spine order with `## <chapter>` headings (what search and agents read), the original file is a `<sha256>.epub` blob that the web reader (foliate-js) renders. Position is a server-side `Progress` record per article (EPUB CFI + fraction), highlights get an optional CFI `anchor`; both are additive serde-default fields, so `EXPORT_VERSION` stays 1. MCP `get_article` pages books (40k chars) so a novel does not fill an agent's context |
+| Web page | Static `web/` files (the whole directory, including `vendor/`) embedded in the binary, served at their path without auth (only paths that exist in the embedded table are public); data via the REST API with a bearer token in localStorage, or none when `GET /me` shows the device is recognised via Tailscale. Plain http, so no service worker/PWA. Markdown rendered server-side (`render.rs`, pulldown-cmark, raw HTML escaped) at `/articles/{id}/html`, `/syntheses/{id}/html` |
 | Quick save | `GET /save?url=&token=` (token in the query only on this route, constant-time check; a trusted Tailscale login needs no token) saves then 303s to `/#/a/<id>`; iOS Shortcut / Android use `POST /articles` |
 | Deploy | systemd user service `marginalia` (linger already on), bound to Tailscale `100.103.153.13`, token in an env file |
 
@@ -34,6 +35,10 @@ Easy access (REST + our MCP) · Synthesis products served to others.
 ```
 
 - `domain.rs`, `repo.rs` are the contract. **Do not change their public items** without the lead's approval.
+  Approved addition (books): `Article`/`ArticleSummary`/`NewArticle` `kind` + `author`, `ArticleSummary::progress`,
+  `Highlight`/`NewHighlight` `anchor` + `location`, `domain::Progress`, `LibraryExport::progress`, and on `Repo`
+  `get_article_by_url`, `get_progress`, `put_progress` (deleting an article also deletes its progress). `epub.rs` is the pure
+  EPUB parser; `App::save_book` hashes, parses (blocking thread), stores the blob and upserts.
   Approved addition (backups): `domain::LibraryExport` / `EXPORT_VERSION`, `Repo::restore`, and in `repo.rs` the free
   functions `export_library` and `validate_export`. Existing items are unchanged.
 - REST and MCP expose the *same* operations by calling `App`; MCP is "REST evolved for agents".

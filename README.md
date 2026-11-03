@@ -91,20 +91,24 @@ closes lingering MCP event streams after 5 seconds.
 ## REST
 
 JSON in and out. With a token set, send `Authorization: Bearer <token>` on everything except `GET /health`, the web
-page files (`/`, `/app.js`, `/app.css`; they hold no data) and `GET /save` (see Quick save). On a Unix socket, a trusted
+web files (everything embedded from `web/`, such as `/`, `/app.js`, `/app.css` and `/vendor/...`; they hold no data) and `GET /save` (see Quick save). On a Unix socket, a trusted
 `Tailscale-User-Login` header works instead of the token (see Tailscale login).
 Errors are `{"error": "..."}`: 400 invalid input, 401 auth, 404 not found, 502 upstream (fetch or LLM), 503 no LLM, 500 storage.
 
 | Method and path | Body / query | Result |
 | --- | --- | --- |
 | `GET /health` | | `{ok, llm}` |
-| `GET /articles` | `limit` (50), `offset` (0) | article summaries, newest first |
+| `GET /articles` | `limit` (50), `offset` (0) | article summaries (`kind` `web`/`book`, `author`, `progress`), newest first |
 | `POST /articles` | `{url}` (fetch) or `{url, title, markdown}` | 201, the article |
 | `GET /articles/{id}` | | article with Markdown body |
-| `DELETE /articles/{id}` | | 204 (also removes its highlights) |
+| `DELETE /articles/{id}` | | 204 (also removes its highlights and reading progress) |
+| `POST /books` | raw EPUB bytes, `Content-Type: application/epub+zip` (or `application/octet-stream`), optional `X-Filename` (URL-encoded) | 201 with the book's article summary; the same bytes again: 200 with the existing one; not an EPUB: 400. Body limit 200 MiB on this route only (see Books) |
+| `GET /articles/{id}/file` | | the stored EPUB (`application/epub+zip`, cached for a year since it is content-addressed); 404 if the article has no EPUB |
+| `GET /articles/{id}/progress` | | the reading position `{article_id, position, fraction, updated_at}`, or `null` before the first update |
+| `PUT /articles/{id}/progress` | `{position, fraction}` (`position` is an EPUB CFI; `fraction` is clamped to 0..1) | the saved progress; 404 for an unknown article |
 | `GET /articles/{id}/html` | | the article Markdown as sanitised HTML (a fragment, `text/html`) |
 | `GET /articles/{id}/highlights` | | highlights |
-| `POST /articles/{id}/highlights` | `{text, note?}` | 201, the highlight |
+| `POST /articles/{id}/highlights` | `{text, note?, anchor?, location?}` (`anchor` is an EPUB CFI, `location` a chapter label; books only) | 201, the highlight |
 | `GET /highlights` | | all highlights |
 | `GET /search` | `q`, `limit` (10) | hits with snippets |
 | `POST /chat` | `{session_id?, message}` | `{session_id, reply}` |
@@ -116,7 +120,7 @@ Errors are `{"error": "..."}`: 400 invalid input, 401 auth, 404 not found, 502 u
 | `GET /syntheses/{id}/html` | | the synthesis body as sanitised HTML |
 | `GET /me` | | `{"auth": "token" \| "tailscale" \| "none", "login": string or null}`: how this request was authorised |
 | `GET /save` | `url`, `token` (query only here; not needed with a trusted Tailscale login) | saves the page, then 303 to `/#/a/<id>` (see Quick save) |
-| `GET /export` | | whole-library snapshot `{version, exported_at, articles, highlights, syntheses}` (see Backup & restore) |
+| `GET /export` | | whole-library snapshot `{version, exported_at, articles, highlights, syntheses, progress}` (see Backup & restore) |
 
 ## Tailscale login (no token on your own devices)
 
@@ -142,6 +146,30 @@ cross-site (`Sec-Fetch-Site`), because unlike a bearer token the login is sent a
 exempt. `GET /save?url=` is a plain link and stays open to the login, so a hostile page could make your browser save an
 article; it cannot read anything.
 
+## Books (EPUB)
+
+A book is an article with `kind: "book"`, so the library list, search, highlights, MCP, export and kb sync treat it like
+any other article. Upload one with `POST /books` (the web page and the app do this); from a shell:
+
+```sh
+curl -H "Authorization: Bearer $MARGINALIA_TOKEN" -H "Content-Type: application/epub+zip" \
+     -H "X-Filename: My%20Book.epub" --data-binary @my-book.epub http://<bind>/books
+```
+
+- The server unzips the EPUB in Rust (no external tools): container.xml, then the OPF for title (`dc:title`), author
+  (`dc:creator`) and the spine. Each linear spine document becomes Markdown through the same converter as web pages, with
+  images dropped, and every section starts with `## <chapter title>` (from the EPUB3 nav or the NCX, else its first
+  heading). That text is the article body, so search and the agent can read the book.
+- The original file is kept in the blob store as `<sha256>.epub` and served at `GET /articles/{id}/file` for the reader.
+  The article's `url` is `urn:sha256:<hex of the file>`, so uploading the same file twice does nothing the second time.
+- Limits: 200 MiB upload, at most 512 MiB unpacked and 20,000 entries (zip bombs are refused), 64 MiB per entry. DRM-protected
+  EPUBs, fixed-layout/image-only books and non-EPUB formats have no readable text and are rejected with 400.
+- Reading progress (`GET`/`PUT /articles/{id}/progress`) is stored on the server so every device resumes at the same place;
+  highlights in a book carry an `anchor` (EPUB CFI) so the reader can repaint them. Deleting a book removes its highlights
+  and progress; the blob stays (blobs are immutable and shared).
+- MCP `get_article` returns a book 40,000 characters at a time (`offset`, `max_chars`, answered with `total_chars` and
+  `next_offset`); web articles still come back whole.
+
 ## Web page
 
 `http://<bind>/` serves a small page from the same server: library (save box, search, article list), reader
@@ -153,7 +181,11 @@ PWA install: use it as a normal page (on a phone, "Add to Home Screen" gives a p
 
 Markdown is rendered on the server (`src/render.rs`, `pulldown-cmark`): raw HTML in an article is shown as text, links
 open in a new tab with `rel="noopener noreferrer"`, and links that are not http, https or mailto lose their `href`.
-The page also ships a Content-Security-Policy that allows only its own script and style.
+The static files (anything under `web/`, embedded in the binary and served publicly at its path, GET only) ship a
+Content-Security-Policy that allows only the page's own script (`script-src 'self'`: no inline script, no `blob:`, so script inside
+an EPUB cannot run). Styles, images and fonts are opened up (inline and `blob:` styles, `data:`/`blob:`/http(s) images)
+because the reader renders each book section in a `blob:` iframe that inherits the policy. The desktop/mobile app's
+`tauri.conf.json` must carry the same policy.
 
 ## App (Android, iOS, macOS, Windows, Linux)
 
@@ -192,7 +224,7 @@ personal Tailscale-only service; rotate `MARGINALIA_TOKEN` if a device is lost.
 
 ## MCP
 
-Tools: `list_articles`, `get_article`, `search`, `list_highlights`, `add_highlight`, `save_url`, `save_markdown`,
+Tools (`list_articles` shows each item's `kind` and `author`; `get_article` pages through books): `list_articles`, `get_article`, `search`, `list_highlights`, `add_highlight`, `save_url`, `save_markdown`,
 `list_syntheses`, `get_synthesis`, `save_synthesis`, `analyse_article`, `write_brief`. Read and add only, no deletes.
 Failures come back as tool errors.
 
@@ -262,10 +294,11 @@ Data lands in `~/.local/share/marginalia/data` (the unit's working directory plu
 nightly backups and a later move to another database engine:
 
 ```json
-{ "version": 1, "exported_at": "...", "articles": [...], "highlights": [...], "syntheses": [...] }
+{ "version": 1, "exported_at": "...", "articles": [...], "highlights": [...], "syntheses": [...], "progress": [...] }
 ```
 
-Rows keep their ids and timestamps. Blobs are not inlined: an article only carries its `blob_key`. The blob files are
+Rows keep their ids and timestamps. Blobs are not inlined: an article only carries its `blob_key` (for a book, the EPUB itself).
+Exports made before books existed still import: the new fields default (`kind` "web", no author, anchors or progress). The blob files are
 immutable and content-addressed, so a backup just copies them. The usage log and chat sessions are not part of the
 snapshot. The export is read through the ordinary `Repo` methods and is not a transaction, which is fine for a nightly job.
 There is no REST import; restoring is a CLI action on a stopped server.

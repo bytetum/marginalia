@@ -19,6 +19,7 @@ struct State {
     articles: Vec<Article>,
     highlights: Vec<Highlight>,
     syntheses: Vec<Synthesis>,
+    progress: Vec<Progress>,
     usage: Vec<(String, Value)>,
 }
 
@@ -124,6 +125,8 @@ impl Repo for MemRepo {
             existing.markdown = new.markdown;
             existing.via = new.via;
             existing.blob_key = new.blob_key;
+            existing.kind = new.kind;
+            existing.author = new.author;
             existing.words = words;
             existing.saved_at = now;
             return Ok(existing.clone());
@@ -138,6 +141,8 @@ impl Repo for MemRepo {
             via: new.via,
             blob_key: new.blob_key,
             saved_at: now,
+            kind: new.kind,
+            author: new.author,
         };
         st.articles.push(article.clone());
         Ok(article)
@@ -146,6 +151,11 @@ impl Repo for MemRepo {
     async fn get_article(&self, id: &str) -> RepoResult<Option<Article>> {
         let st = self.state.read().await;
         Ok(st.articles.iter().find(|a| a.id == id).cloned())
+    }
+
+    async fn get_article_by_url(&self, url: &str) -> RepoResult<Option<Article>> {
+        let st = self.state.read().await;
+        Ok(st.articles.iter().find(|a| a.url == url).cloned())
     }
 
     async fn list_articles(&self, limit: u32, offset: u32) -> RepoResult<Vec<ArticleSummary>> {
@@ -166,6 +176,9 @@ impl Repo for MemRepo {
                     .iter()
                     .filter(|h| h.article_id == a.id)
                     .count() as u32,
+                kind: a.kind.clone(),
+                author: a.author.clone(),
+                progress: st.progress.iter().find(|p| p.article_id == a.id).map(|p| p.fraction),
             })
             .collect())
     }
@@ -179,6 +192,7 @@ impl Repo for MemRepo {
             .ok_or_else(|| RepoError::NotFound(format!("article {id}")))?;
         st.articles.remove(idx);
         st.highlights.retain(|h| h.article_id != id);
+        st.progress.retain(|p| p.article_id != id);
         Ok(())
     }
 
@@ -196,9 +210,35 @@ impl Repo for MemRepo {
             text: new.text,
             note: new.note,
             created_at: Utc::now(),
+            anchor: new.anchor,
+            location: new.location,
         };
         st.highlights.push(highlight.clone());
         Ok(highlight)
+    }
+
+    async fn get_progress(&self, article_id: &str) -> RepoResult<Option<Progress>> {
+        let st = self.state.read().await;
+        Ok(st.progress.iter().find(|p| p.article_id == article_id).cloned())
+    }
+
+    async fn put_progress(&self, article_id: &str, position: &str, fraction: f64) -> RepoResult<Progress> {
+        if position.trim().is_empty() {
+            return Err(RepoError::Invalid("progress position is blank".into()));
+        }
+        let mut st = self.state.write().await;
+        if !st.articles.iter().any(|a| a.id == article_id) {
+            return Err(RepoError::NotFound(format!("article {article_id}")));
+        }
+        let progress = Progress {
+            article_id: article_id.into(),
+            position: position.into(),
+            fraction: repo::clamp_fraction(fraction),
+            updated_at: Utc::now(),
+        };
+        st.progress.retain(|p| p.article_id != article_id);
+        st.progress.push(progress.clone());
+        Ok(progress)
     }
 
     async fn list_highlights(&self, article_id: Option<&str>) -> RepoResult<Vec<Highlight>> {
@@ -303,12 +343,13 @@ impl Repo for MemRepo {
     async fn restore(&self, export: &LibraryExport) -> RepoResult<()> {
         repo::validate_export(export)?;
         let mut st = self.state.write().await;
-        if !(st.articles.is_empty() && st.highlights.is_empty() && st.syntheses.is_empty()) {
+        if !(st.articles.is_empty() && st.highlights.is_empty() && st.syntheses.is_empty() && st.progress.is_empty()) {
             return Err(RepoError::Invalid("restore needs an empty library, but this one already has data".into()));
         }
         st.articles = export.articles.clone();
         st.highlights = export.highlights.clone();
         st.syntheses = export.syntheses.clone();
+        st.progress = export.progress.clone();
         Ok(())
     }
 }
@@ -325,6 +366,8 @@ mod tests {
             markdown: markdown.into(),
             via: "manual".into(),
             blob_key: None,
+            kind: KIND_WEB.into(),
+            author: None,
         }
     }
 
@@ -333,6 +376,8 @@ mod tests {
             article_id: article_id.into(),
             text: text.into(),
             note: None,
+            anchor: None,
+            location: None,
         }
     }
 

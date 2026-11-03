@@ -207,7 +207,7 @@ impl Agent {
             }
             "add_highlight" => {
                 let note = args["note"].as_str().filter(|n| !n.trim().is_empty()).map(str::to_string);
-                let highlight = self.repo.add_highlight(NewHighlight { article_id: article_id(), text: arg("text"), note }).await?;
+                let highlight = self.repo.add_highlight(NewHighlight { article_id: article_id(), text: arg("text"), note, anchor: None, location: None }).await?;
                 // Usage logging is best-effort: it must never fail the operation.
                 let _ = self.repo.log_usage("highlight", json!({ "id": highlight.id, "article_id": highlight.article_id, "by": "agent" })).await;
                 to_json(&highlight)
