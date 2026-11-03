@@ -3,7 +3,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A saved article. `markdown` is the cleaned text the agent reads.
+/// `Article::kind` of a saved web page.
+pub const KIND_WEB: &str = "web";
+/// `Article::kind` of an uploaded EPUB.
+pub const KIND_BOOK: &str = "book";
+
+fn default_kind() -> String {
+    KIND_WEB.into()
+}
+
+/// A saved article. `markdown` is the cleaned text the agent reads. A book is an article of kind "book": its url
+/// is `urn:sha256:<hex of the EPUB bytes>`, `via` is "epub" and `blob_key` names the stored EPUB.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Article {
     pub id: String,
@@ -16,6 +26,11 @@ pub struct Article {
     /// Key of the raw page in the blob store, if kept.
     pub blob_key: Option<String>,
     pub saved_at: DateTime<Utc>,
+    /// "web" | "book".
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub author: Option<String>,
 }
 
 /// Article without its body, for lists.
@@ -28,6 +43,13 @@ pub struct ArticleSummary {
     pub via: String,
     pub saved_at: DateTime<Utc>,
     pub highlight_count: u32,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Reading progress, 0.0..=1.0. Only books that have been opened have one.
+    #[serde(default)]
+    pub progress: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +59,10 @@ pub struct NewArticle {
     pub markdown: String,
     pub via: String,
     pub blob_key: Option<String>,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,6 +72,12 @@ pub struct Highlight {
     pub text: String,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Where in a book: an EPUB CFI string. Web articles have none.
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// Chapter label, for display only.
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +85,21 @@ pub struct NewHighlight {
     pub article_id: String,
     pub text: String,
     pub note: Option<String>,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+/// Where the reader left off in a book. One per article, replaced on every update.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Progress {
+    pub article_id: String,
+    /// EPUB CFI.
+    pub position: String,
+    /// 0.0..=1.0 through the book.
+    pub fraction: f64,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,4 +177,7 @@ pub struct LibraryExport {
     pub highlights: Vec<Highlight>,
     /// Oldest first (by `created_at`, then id).
     pub syntheses: Vec<Synthesis>,
+    /// By article id.
+    #[serde(default)]
+    pub progress: Vec<Progress>,
 }

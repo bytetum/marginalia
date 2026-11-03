@@ -519,3 +519,294 @@ async fn tailscale_login_cannot_be_used_by_cross_site_writes() {
     let token = [("authorization", "Bearer s3cret"), ("sec-fetch-site", "cross-site")];
     assert_ne!(call_with(&router, "POST", "/briefs", &token).await.0, StatusCode::FORBIDDEN);
 }
+
+// ---------- books (EPUB) ----------
+
+/// A tiny valid EPUB3 built here: one chapter per entry of `chapters` (title, paragraphs), titled by the nav.
+fn epub(title: &str, chapters: &[(&str, Vec<String>)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut add = |name: &str, content: &str| {
+        zip.start_file(name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).expect("entry");
+        zip.write_all(content.as_bytes()).expect("write");
+    };
+    add("mimetype", "application/epub+zip");
+    add(
+        "META-INF/container.xml",
+        r#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+    );
+    let manifest: String = (0..chapters.len()).map(|i| format!(r#"<item id="c{i}" href="c{i}.xhtml" media-type="application/xhtml+xml"/>"#)).collect();
+    let spine: String = (0..chapters.len()).map(|i| format!(r#"<itemref idref="c{i}"/>"#)).collect();
+    add(
+        "content.opf",
+        &format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>Test Author</dc:creator></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{manifest}</manifest><spine>{spine}</spine></package>"#
+        ),
+    );
+    let links: String = chapters.iter().enumerate().map(|(i, (t, _))| format!(r#"<li><a href="c{i}.xhtml">{t}</a></li>"#)).collect();
+    add(
+        "nav.xhtml",
+        &format!(r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol>{links}</ol></nav></body></html>"#),
+    );
+    for (i, (_, paras)) in chapters.iter().enumerate() {
+        let body: String = paras.iter().map(|p| format!("<p>{p}</p>")).collect();
+        add(&format!("c{i}.xhtml"), &format!(r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>"#));
+    }
+    zip.finish().expect("finish").into_inner()
+}
+
+fn small_book() -> Vec<u8> {
+    epub(
+        "Otter Handbook",
+        &[("Sleeping", vec!["Otters hold hands while they sleep.".into()]), ("Eating", vec!["Otters crack clams on their bellies.".into()])],
+    )
+}
+
+/// Any request with a raw body and arbitrary headers; returns status, headers and the body bytes.
+async fn raw(router: &Router, method: &str, uri: &str, headers: &[(&str, &str)], body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = router.clone().oneshot(req.body(Body::from(body)).expect("request")).await.expect("response");
+    let (parts, body) = res.into_parts();
+    (parts.status, parts.headers, body.collect().await.expect("body").to_bytes().to_vec())
+}
+
+fn auth_header() -> String {
+    format!("Bearer {TOKEN}")
+}
+
+async fn upload(router: &Router, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let auth = auth_header();
+    let headers = [("authorization", auth.as_str()), ("content-type", "application/epub+zip"), ("x-filename", "Otter%20Handbook.epub")];
+    let (status, _, body) = raw(router, "POST", "/books", &headers, bytes).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn uploading_a_book_creates_dedups_serves_the_file_and_rejects_non_epubs() {
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+    let bytes = small_book();
+
+    let (status, book) = upload(&router, bytes.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{book}");
+    assert_eq!((book["kind"].as_str(), book["author"].as_str(), book["via"].as_str()), (Some("book"), Some("Test Author"), Some("epub")));
+    assert_eq!(book["title"], "Otter Handbook");
+    assert!(book["url"].as_str().is_some_and(|u| u.starts_with("urn:sha256:") && u.len() == "urn:sha256:".len() + 64));
+    assert_eq!((book["highlight_count"].clone(), book["progress"].clone()), (json!(0), Value::Null));
+    let id = book["id"].as_str().expect("id").to_string();
+
+    // The same bytes again: 200 and the same book, not a second one.
+    let (status, again) = upload(&router, bytes.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["id"], id.as_str());
+    let (_, listed) = call(&router, "GET", "/articles", Some(TOKEN), None).await;
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(listed[0]["kind"], "book");
+
+    // The article carries the book text in reading order, chapter titles from the nav.
+    let (_, article) = call(&router, "GET", &format!("/articles/{id}"), Some(TOKEN), None).await;
+    assert_eq!(article["kind"], "book");
+    assert_eq!(article["blob_key"].as_str().map(|k| k.ends_with(".epub")), Some(true));
+    let md = article["markdown"].as_str().expect("markdown");
+    assert!(md.starts_with("## Sleeping\n\nOtters hold hands while they sleep."), "{md}");
+    assert!(md.contains("## Eating\n\nOtters crack clams"), "{md}");
+
+    // The page asks for the metadata only, and a book has no rendered-HTML view (it is read from its EPUB).
+    let (_, meta) = call(&router, "GET", &format!("/articles/{id}?body=false"), Some(TOKEN), None).await;
+    assert_eq!((meta["kind"].as_str(), meta["markdown"].as_str()), (Some("book"), Some("")));
+    assert_eq!(call(&router, "GET", &format!("/articles/{id}/html"), Some(TOKEN), None).await.0, StatusCode::NOT_FOUND);
+
+    // The original bytes come back, cacheable forever, behind the token.
+    let uri = format!("/articles/{id}/file");
+    assert_eq!(raw(&router, "GET", &uri, &[], vec![]).await.0, StatusCode::UNAUTHORIZED);
+    let auth = auth_header();
+    let (status, headers, body) = raw(&router, "GET", &uri, &[("authorization", &auth)], vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+    assert_eq!(headers[header::CONTENT_TYPE], "application/epub+zip");
+    assert_eq!(headers[header::CACHE_CONTROL], "private, max-age=31536000, immutable");
+
+    // Not an EPUB: 400 with a JSON error. Also an unauthenticated upload and a web article's /file.
+    for junk in [b"hello, not a zip".to_vec(), Vec::new(), b"PK\x03\x04 truncated".to_vec()] {
+        let (status, body) = upload(&router, junk).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().is_some_and(|e| e.contains("EPUB")), "{body}");
+    }
+    assert_eq!(raw(&router, "POST", "/books", &[("content-type", "application/epub+zip")], bytes).await.0, StatusCode::UNAUTHORIZED);
+    let web = save_sample(&router).await;
+    assert_eq!(call(&router, "GET", &format!("/articles/{web}/file"), Some(TOKEN), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(call(&router, "GET", "/articles/nope/file", Some(TOKEN), None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn only_book_uploads_may_exceed_the_default_body_limit() {
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+    // Over axum's 2 MiB default, so this only passes with the per-route limit.
+    let big = epub("Big", &[("Part", vec!["word ".repeat(100).trim().to_string(); 6000])]);
+    assert!(big.len() > 2 * 1024 * 1024, "{}", big.len());
+    assert_eq!(upload(&router, big.clone()).await.0, StatusCode::CREATED);
+
+    let auth = auth_header();
+    let (status, _, _) = raw(&router, "POST", "/articles", &[("authorization", &auth), ("content-type", "application/json")], big).await;
+    // The JSON extractor reports the body-limit rejection as its usual 400.
+    assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE, "{status}");
+}
+
+#[tokio::test]
+async fn progress_and_anchored_highlights_roundtrip_and_go_with_the_book() {
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+    let (_, book) = upload(&router, small_book()).await;
+    let id = book["id"].as_str().expect("id").to_string();
+    let uri = format!("/articles/{id}/progress");
+
+    assert_eq!(call(&router, "GET", &uri, Some(TOKEN), None).await, (StatusCode::OK, Value::Null));
+    assert_eq!(call(&router, "GET", &uri, None, None).await.0, StatusCode::UNAUTHORIZED);
+
+    let (status, put) = call(&router, "PUT", &uri, Some(TOKEN), Some(json!({ "position": "epubcfi(/6/4!/4/2/1:7)", "fraction": 0.42 }))).await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!((put["article_id"].as_str(), put["position"].as_str(), put["fraction"].as_f64()), (Some(id.as_str()), Some("epubcfi(/6/4!/4/2/1:7)"), Some(0.42)));
+    assert!(put["updated_at"].is_string());
+    assert_eq!(call(&router, "GET", &uri, Some(TOKEN), None).await, (StatusCode::OK, put.clone()));
+    let (_, clamped) = call(&router, "PUT", &uri, Some(TOKEN), Some(json!({ "position": "epubcfi(/6/6)", "fraction": 1.7 }))).await;
+    assert_eq!(clamped["fraction"].as_f64(), Some(1.0));
+
+    assert_eq!(call(&router, "PUT", "/articles/nope/progress", Some(TOKEN), Some(json!({ "position": "p", "fraction": 0.1 }))).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(call(&router, "PUT", &uri, Some(TOKEN), Some(json!({ "position": "  ", "fraction": 0.1 }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&router, "PUT", &uri, Some(TOKEN), Some(json!({ "fraction": 0.1 }))).await.0, StatusCode::BAD_REQUEST);
+
+    // The list shows the fraction.
+    let (_, listed) = call(&router, "GET", "/articles", Some(TOKEN), None).await;
+    assert_eq!(listed[0]["progress"].as_f64(), Some(1.0));
+
+    // Highlights take an anchor and a chapter label; plain ones still work.
+    let hl_uri = format!("/articles/{id}/highlights");
+    let anchored = json!({ "text": "hold hands", "note": "cute", "anchor": "epubcfi(/6/14!/4/2,/1:0,/1:27)", "location": "Sleeping" });
+    let (status, h) = call(&router, "POST", &hl_uri, Some(TOKEN), Some(anchored)).await;
+    assert_eq!(status, StatusCode::CREATED, "{h}");
+    assert_eq!((h["anchor"].as_str(), h["location"].as_str()), (Some("epubcfi(/6/14!/4/2,/1:0,/1:27)"), Some("Sleeping")));
+    let (_, plain) = call(&router, "POST", &hl_uri, Some(TOKEN), Some(json!({ "text": "clams" }))).await;
+    assert_eq!((plain["anchor"].clone(), plain["location"].clone()), (Value::Null, Value::Null));
+    let (_, listed_hl) = call(&router, "GET", &hl_uri, Some(TOKEN), None).await;
+    assert_eq!(listed_hl[0]["anchor"], "epubcfi(/6/14!/4/2,/1:0,/1:27)");
+
+    // The export carries progress; deleting the book takes progress and highlights with it.
+    let (_, export) = call(&router, "GET", "/export", Some(TOKEN), None).await;
+    assert_eq!(export["progress"].as_array().map(Vec::len), Some(1));
+    assert_eq!(export["articles"][0]["kind"], "book");
+    assert_eq!(call(&router, "DELETE", &format!("/articles/{id}"), Some(TOKEN), None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(call(&router, "GET", &uri, Some(TOKEN), None).await, (StatusCode::OK, Value::Null));
+    assert_eq!(call(&router, "GET", &hl_uri, Some(TOKEN), None).await, (StatusCode::OK, json!([])));
+    let (_, export) = call(&router, "GET", "/export", Some(TOKEN), None).await;
+    assert_eq!(export["progress"], json!([]));
+    // The same file again is a new book, since the old one is gone.
+    assert_eq!(upload(&router, small_book()).await.0, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn embedded_web_files_are_public_and_everything_else_still_needs_the_token() {
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+
+    let (status, headers, body) = raw(&router, "GET", "/vendor/README.txt", &[], vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+    assert!(String::from_utf8_lossy(&body).contains("foliate-js"));
+    let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().expect("csp");
+    assert!(csp.contains("script-src 'self';") && csp.contains("frame-src 'self' blob:"), "{csp}");
+    assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+
+    // Not in the embedded table (or hidden, or a directory, or a traversal): not public, so 401 without the token.
+    for path in ["/vendor/missing.js", "/vendor/", "/vendor", "/secret", "/vendor/../Cargo.toml", "/vendor/.hidden", "/%2e%2e/Cargo.toml"] {
+        assert_eq!(raw(&router, "GET", path, &[], vec![]).await.0, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // With the token an unknown path is a plain 404, and a static path is GET only.
+    let auth = auth_header();
+    assert_eq!(raw(&router, "GET", "/vendor/missing.js", &[("authorization", &auth)], vec![]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(raw(&router, "POST", "/vendor/README.txt", &[], vec![]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(raw(&router, "POST", "/vendor/README.txt", &[("authorization", &auth)], vec![]).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_reads_books_a_page_at_a_time() {
+    let (app, _dir) = app();
+    let router = api::router(app.clone(), token_auth());
+    // About 150k characters of "é" text, so slicing must count characters, not bytes.
+    let (_, book) = upload(&router, epub("Long", &[("All", vec!["é".repeat(1000); 150])])).await;
+    let id = book["id"].as_str().expect("id").to_string();
+    let web_body = json!({ "url": "https://example.com/w", "title": "W", "markdown": "x".repeat(60_000) });
+    let (_, web) = call(&router, "POST", "/articles", Some(TOKEN), Some(web_body)).await;
+    let web_id = web["id"].as_str().expect("id").to_string();
+
+    let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+    let server = tokio::spawn(async move {
+        let running = MarginaliaMcp::new(app).serve(server_io).await.expect("serve");
+        let _ = running.waiting().await;
+    });
+    let client = ClientConfig::default().serve(client_io).await.expect("client");
+    let get = |a: Value| {
+        let client = &client;
+        async move {
+            let res = client.call_tool(CallToolRequestParams::new("get_article").with_arguments(args(a))).await.expect("get_article");
+            assert_ne!(res.is_error, Some(true));
+            serde_json::from_str::<Value>(&text_of(&res)).expect("json")
+        }
+    };
+
+    let first = get(json!({ "id": id })).await;
+    assert_eq!(first["kind"], "book");
+    assert_eq!(first["offset"], 0);
+    let total = first["total_chars"].as_u64().expect("total") as usize;
+    assert!(total > 150_000, "{total}");
+    assert_eq!(first["markdown"].as_str().expect("md").chars().count(), 40_000);
+    assert!(first["markdown"].as_str().expect("md").starts_with("## All"));
+    assert_eq!(first["next_offset"], 40_000);
+
+    let mut seen = 40_000;
+    let mut next = first["next_offset"].as_u64();
+    while let Some(offset) = next {
+        let page = get(json!({ "id": id, "offset": offset, "max_chars": 70_000 })).await;
+        seen += page["markdown"].as_str().expect("md").chars().count();
+        next = page["next_offset"].as_u64();
+    }
+    assert_eq!(seen, total);
+    let past = get(json!({ "id": id, "offset": total + 5 })).await;
+    assert_eq!((past["markdown"].as_str(), past["next_offset"].clone()), (Some(""), Value::Null));
+
+    // A web article is whole unless asked otherwise, and has no paging fields.
+    let whole = get(json!({ "id": web_id })).await;
+    assert_eq!(whole["markdown"].as_str().map(str::len), Some(60_000));
+    assert!(whole.get("next_offset").is_none());
+    assert_eq!(whole["kind"], "web");
+    let part = get(json!({ "id": web_id, "offset": 10, "max_chars": 5 })).await;
+    assert_eq!((part["markdown"].as_str(), part["next_offset"].as_u64()), (Some("xxxxx"), Some(15)));
+
+    // list_articles shows kind and author.
+    let listed = client.call_tool(CallToolRequestParams::new("list_articles").with_arguments(args(json!({})))).await.expect("list");
+    let rows: Value = serde_json::from_str(&text_of(&listed)).expect("json");
+    assert!(rows.as_array().expect("rows").iter().any(|r| r["kind"] == "book" && r["author"] == "Test Author"));
+
+    let _ = client.cancel().await;
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn cors_lets_the_app_put_progress_and_upload_books() {
+    let (app, _dir) = app();
+    let router = api::router(app, token_auth());
+    let res = with_origin(
+        &router,
+        "OPTIONS",
+        "/articles/x/progress",
+        "tauri://localhost",
+        &[("access-control-request-method", "PUT"), ("access-control-request-headers", "authorization,content-type,x-filename")],
+    )
+    .await;
+    assert!(res.status().is_success(), "{}", res.status());
+    assert!(hv(&res, "access-control-allow-methods").is_some_and(|m| m.contains("PUT")));
+    assert!(hv(&res, "access-control-allow-headers").is_some_and(|h| h.to_ascii_lowercase().contains("x-filename")));
+}

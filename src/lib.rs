@@ -18,6 +18,7 @@ pub mod surreal;
 
 // App
 pub mod agent;
+pub mod epub;
 pub mod extract;
 pub mod render;
 pub mod service;

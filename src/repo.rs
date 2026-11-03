@@ -29,15 +29,23 @@ pub trait Repo: Send + Sync {
     /// Insert, or update in place when an article with the same `url` exists (its `id` is kept).
     async fn upsert_article(&self, new: NewArticle) -> RepoResult<Article>;
     async fn get_article(&self, id: &str) -> RepoResult<Option<Article>>;
+    /// The article saved under exactly this `url`, if any.
+    async fn get_article_by_url(&self, url: &str) -> RepoResult<Option<Article>>;
     /// Newest first.
     async fn list_articles(&self, limit: u32, offset: u32) -> RepoResult<Vec<ArticleSummary>>;
-    /// Also deletes the article's highlights. `NotFound` if missing.
+    /// Also deletes the article's highlights and progress (blobs stay: they are immutable and shared). `NotFound` if missing.
     async fn delete_article(&self, id: &str) -> RepoResult<()>;
 
     /// `NotFound` if the article does not exist; `Invalid` if `text` is blank.
     async fn add_highlight(&self, new: NewHighlight) -> RepoResult<Highlight>;
     /// Oldest first. `None` = all highlights.
     async fn list_highlights(&self, article_id: Option<&str>) -> RepoResult<Vec<Highlight>>;
+
+    /// Where the reader left off. `None` until `put_progress` was called (or when the article does not exist).
+    async fn get_progress(&self, article_id: &str) -> RepoResult<Option<Progress>>;
+    /// Replace the article's progress; `fraction` is clamped to 0..=1 (NaN becomes 0) and `updated_at` is now.
+    /// `NotFound` if the article does not exist; `Invalid` if `position` is blank.
+    async fn put_progress(&self, article_id: &str, position: &str, fraction: f64) -> RepoResult<Progress>;
 
     /// Full-text search over article titles, bodies and highlight text. Best first.
     /// Blank queries return an empty list, never an error.
@@ -53,7 +61,7 @@ pub trait Repo: Send + Sync {
 
     /// Load a [`LibraryExport`] into an **empty** repo, keeping every id and timestamp exactly as exported
     /// (unlike `upsert_article` and friends, which generate them). All or nothing: on error nothing is written.
-    /// `Invalid` if the repo already holds any article, highlight or synthesis (the usage log does not count),
+    /// `Invalid` if the repo already holds any article, highlight, synthesis or progress (the usage log does not count),
     /// or if the export fails `validate_export`. The usage log is not part of an export and is not restored.
     async fn restore(&self, export: &LibraryExport) -> RepoResult<()>;
 }
@@ -69,6 +77,11 @@ pub trait BlobStore: Send + Sync {
 /// Word count used by every adapter, so they agree.
 pub fn count_words(markdown: &str) -> u32 {
     markdown.split_whitespace().count() as u32
+}
+
+/// `fraction` as stored: inside 0..=1, NaN as 0.
+pub fn clamp_fraction(fraction: f64) -> f64 {
+    if fraction.is_nan() { 0.0 } else { fraction.clamp(0.0, 1.0) }
 }
 
 /// New random id. All adapters use this format.
@@ -110,15 +123,20 @@ pub async fn export_library(repo: &dyn Repo) -> RepoResult<LibraryExport> {
     let mut highlights = repo.list_highlights(None).await?;
     highlights.retain(|h| kept.contains(h.article_id.as_str()));
     let mut syntheses = repo.list_syntheses(None, u32::MAX).await?;
+    let mut progress = Vec::new();
+    for a in articles.iter().filter(|a| a.kind == KIND_BOOK) {
+        progress.extend(repo.get_progress(&a.id).await?);
+    }
 
     articles.sort_by(|a, b| a.saved_at.cmp(&b.saved_at).then_with(|| a.id.cmp(&b.id)));
     highlights.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
     syntheses.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
-    Ok(LibraryExport { version: EXPORT_VERSION, exported_at: chrono::Utc::now(), articles, highlights, syntheses })
+    progress.sort_by(|a, b| a.article_id.cmp(&b.article_id));
+    Ok(LibraryExport { version: EXPORT_VERSION, exported_at: chrono::Utc::now(), articles, highlights, syntheses, progress })
 }
 
 /// Checks an export before `Repo::restore` writes it, shared by every adapter: supported `version`, no blank or
-/// duplicate ids, no duplicate article urls, and every highlight points at an article in the export.
+/// duplicate ids, no duplicate article urls, and every highlight and progress record points at an article in the export (one progress per article).
 /// (A synthesis may cite article ids that no longer exist: the article may have been deleted since.)
 pub fn validate_export(export: &LibraryExport) -> RepoResult<()> {
     let invalid = |m: String| Err(RepoError::Invalid(m));
@@ -142,6 +160,15 @@ pub fn validate_export(export: &LibraryExport) -> RepoResult<()> {
         }
         if !ids.contains(h.article_id.as_str()) {
             return invalid(format!("highlight {} points at article {}, which is not in the export", h.id, h.article_id));
+        }
+    }
+    let mut progress_ids = HashSet::new();
+    for p in &export.progress {
+        if !ids.contains(p.article_id.as_str()) {
+            return invalid(format!("progress points at article {}, which is not in the export", p.article_id));
+        }
+        if !progress_ids.insert(p.article_id.as_str()) {
+            return invalid(format!("duplicate progress for article {}", p.article_id));
         }
     }
     let mut syn_ids = HashSet::new();

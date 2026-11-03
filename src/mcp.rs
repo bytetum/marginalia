@@ -16,7 +16,9 @@ use crate::service::{App, AppError};
 
 const INSTRUCTIONS: &str = "Marginalia is the user's personal reading library: articles they saved, the passages they \
 highlighted, and synthesis products (analyses and briefs) written about them. Always search the library before answering \
-a question about it, then read the relevant articles with get_article, and cite article titles. Never invent articles or \
+a question about it, then read the relevant articles with get_article, and cite article titles. Books (kind \"book\", \
+uploaded EPUBs) are articles too but can be hundreds of thousands of characters: get_article returns them in pages \
+(see its offset, max_chars and next_offset), so read the part you need, using search snippets to choose where. Never invent articles or \
 quotes; if the library has nothing relevant, say so. Use add_highlight to record a passage the user wants to keep, and \
 save_synthesis to store a finished analysis or brief worth keeping.";
 
@@ -37,6 +39,25 @@ fn json_text<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| e.to_string())
 }
 
+/// Characters of a book that `get_article` returns per call unless told otherwise.
+const BOOK_PAGE_CHARS: usize = 40_000;
+
+/// The article with its body cut to `max_chars` characters from character `offset`, plus where that window sits:
+/// `offset`, `total_chars` and `next_offset` (null when the window reaches the end).
+fn page_of(article: &Article, offset: usize, max_chars: Option<usize>) -> serde_json::Value {
+    let total = article.markdown.chars().count();
+    let start = offset.min(total);
+    let len = max_chars.unwrap_or(usize::MAX).min(total - start);
+    let byte_at = |chars: usize| article.markdown.char_indices().nth(chars).map_or(article.markdown.len(), |(i, _)| i);
+    let (from, to) = (byte_at(start), byte_at(start + len));
+    let mut value = serde_json::to_value(article).unwrap_or_default();
+    value["markdown"] = article.markdown[from..to].into();
+    value["offset"] = start.into();
+    value["total_chars"] = total.into();
+    value["next_offset"] = if start + len < total { (start + len).into() } else { serde_json::Value::Null };
+    value
+}
+
 fn fail(e: impl Into<AppError>) -> String {
     e.into().to_string()
 }
@@ -53,6 +74,16 @@ struct ListArticlesArgs {
 struct IdArgs {
     /// The id.
     id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetArticleArgs {
+    /// The article id.
+    id: String,
+    /// Character offset into the Markdown body to start at (default 0).
+    offset: Option<usize>,
+    /// Most characters of the body to return. Defaults to 40000 for books and to the whole body for web articles.
+    max_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -130,18 +161,24 @@ struct BriefArgs {
 
 #[tool_router]
 impl MarginaliaMcp {
-    #[tool(description = "List saved articles, newest first (id, url, title, words, highlight_count; no body).")]
+    #[tool(description = "List saved articles and books, newest first (id, url, title, kind \"web\" or \"book\", author, words, highlight_count; no body).")]
     async fn list_articles(&self, Parameters(a): Parameters<ListArticlesArgs>) -> Result<String, String> {
         let rows = self.app.repo().list_articles(a.limit.unwrap_or(50), a.offset.unwrap_or(0)).await.map_err(fail)?;
         json_text(&rows)
     }
 
-    #[tool(description = "Read one article in full (Markdown body included) by id.")]
-    async fn get_article(&self, Parameters(a): Parameters<IdArgs>) -> Result<String, String> {
-        match self.app.repo().get_article(&a.id).await.map_err(fail)? {
-            Some(article) => json_text(&article),
-            None => Err(format!("not found: no article with id {}", a.id)),
+    #[tool(description = "Read one article by id (Markdown body included). A web article comes back whole. A book (kind \"book\") \
+comes back one page at a time: at most max_chars (default 40000) characters of the body from offset (default 0), with \
+total_chars and next_offset (null at the end); call again with offset = next_offset to continue. Chapters start with a \
+\"## \" heading.")]
+    async fn get_article(&self, Parameters(a): Parameters<GetArticleArgs>) -> Result<String, String> {
+        let Some(article) = self.app.repo().get_article(&a.id).await.map_err(fail)? else {
+            return Err(format!("not found: no article with id {}", a.id));
+        };
+        if article.kind != KIND_BOOK && a.offset.is_none() && a.max_chars.is_none() {
+            return json_text(&article);
         }
+        json_text(&page_of(&article, a.offset.unwrap_or(0), a.max_chars.or((article.kind == KIND_BOOK).then_some(BOOK_PAGE_CHARS))))
     }
 
     #[tool(description = "Keyword search over article titles, bodies and highlights. Returns best hits first with snippets.")]

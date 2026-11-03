@@ -17,6 +17,8 @@ fn new_article(url: &str, title: &str, markdown: &str) -> NewArticle {
         markdown: markdown.into(),
         via: "manual".into(),
         blob_key: None,
+        kind: KIND_WEB.into(),
+        author: None,
     }
 }
 
@@ -25,11 +27,23 @@ fn new_highlight(article_id: &str, text: &str) -> NewHighlight {
         article_id: article_id.into(),
         text: text.into(),
         note: None,
+        anchor: None,
+        location: None,
     }
 }
 
 async fn article(repo: &dyn Repo, url: &str, title: &str, markdown: &str) -> Article {
     repo.upsert_article(new_article(url, title, markdown)).await.unwrap()
+}
+
+fn new_book(url: &str, title: &str, markdown: &str) -> NewArticle {
+    NewArticle {
+        via: "epub".into(),
+        blob_key: Some("c0ffee.epub".into()),
+        kind: KIND_BOOK.into(),
+        author: Some("Ada Lovelace".into()),
+        ..new_article(url, title, markdown)
+    }
 }
 
 fn collapse(s: &str) -> String {
@@ -77,6 +91,8 @@ async fn article_roundtrips_unicode_and_all_fields(repo: &dyn Repo) {
             markdown: md.into(),
             via: "readability".into(),
             blob_key: Some("k.html".into()),
+            kind: KIND_WEB.into(),
+            author: None,
         })
         .await
         .unwrap();
@@ -164,6 +180,8 @@ async fn add_highlight_keeps_text_and_note(repo: &dyn Repo) {
             article_id: a.id.clone(),
             text: "  keep my spacing \"as is\"  ".into(),
             note: Some("a note".into()),
+            anchor: None,
+            location: None,
         })
         .await
         .unwrap();
@@ -369,17 +387,32 @@ async fn populate(repo: &dyn Repo) {
             markdown: "# Kinh tế\n\nLãi suất ngân hàng tăng.".into(),
             via: "readability".into(),
             blob_key: Some("0123abcd.html".into()),
+            kind: KIND_WEB.into(),
+            author: None,
         })
         .await
         .unwrap();
     let b = article(repo, "https://x/b", "Beta", "beta body text").await;
-    article(repo, "https://x/c", "Gamma", "gamma").await;
+    let book = repo.upsert_article(new_book("urn:sha256:c0ffee", "Gamma", "gamma")).await.unwrap();
+    repo.put_progress(&book.id, "epubcfi(/6/4!/4/2/1:0)", 0.25).await.unwrap();
     article(repo, "https://x/b", "Beta renamed", "beta body text again").await;
     repo.add_highlight(new_highlight(&a.id, "Lãi suất")).await.unwrap();
-    repo.add_highlight(NewHighlight { article_id: a.id.clone(), text: "ngân hàng".into(), note: Some("why?".into()) })
-        .await
-        .unwrap();
-    repo.add_highlight(new_highlight(&b.id, "beta")).await.unwrap();
+    repo.add_highlight(NewHighlight {
+        article_id: a.id.clone(),
+        text: "ngân hàng".into(),
+        note: Some("why?".into()),
+        anchor: None,
+        location: None,
+    })
+    .await
+    .unwrap();
+    repo.add_highlight(NewHighlight {
+        anchor: Some("epubcfi(/6/14!/4/2,/1:0,/1:4)".into()),
+        location: Some("Chapter 3".into()),
+        ..new_highlight(&b.id, "beta")
+    })
+    .await
+    .unwrap();
     repo.save_synthesis(NewSynthesis {
         kind: SynthesisKind::Analysis,
         title: "Analysis: A".into(),
@@ -406,6 +439,7 @@ fn same_rows(a: &LibraryExport, b: &LibraryExport) {
     assert_eq!(a.articles, b.articles);
     assert_eq!(a.highlights, b.highlights);
     assert_eq!(a.syntheses, b.syntheses);
+    assert_eq!(a.progress, b.progress);
 }
 
 async fn restore_roundtrip_keeps_ids_and_timestamps(src: &dyn Repo, dst: &dyn Repo) {
@@ -413,6 +447,8 @@ async fn restore_roundtrip_keeps_ids_and_timestamps(src: &dyn Repo, dst: &dyn Re
     let before = export_library(src).await.unwrap();
     assert_eq!(before.version, 1);
     assert_eq!((before.articles.len(), before.highlights.len(), before.syntheses.len()), (3, 3, 2));
+    assert_eq!(before.progress.len(), 1);
+    assert_eq!(before.progress[0].fraction, 0.25);
 
     // The export survives JSON, which is what the backup script stores.
     let json = serde_json::to_string(&before).unwrap();
@@ -486,6 +522,10 @@ async fn restore_rejects_a_bad_export_and_leaves_the_repo_empty(src: &dyn Repo, 
     dup_syn.syntheses[1].id = dup_syn.syntheses[0].id.clone();
     let mut blank_id = good.clone();
     blank_id.articles[0].id = String::new();
+    let mut orphan_progress = good.clone();
+    orphan_progress.progress[0].article_id = "nope".into();
+    let mut dup_progress = good.clone();
+    dup_progress.progress.push(dup_progress.progress[0].clone());
 
     for (name, bad) in [
         ("version", bad_version),
@@ -495,11 +535,14 @@ async fn restore_rejects_a_bad_export_and_leaves_the_repo_empty(src: &dyn Repo, 
         ("duplicate highlight id", dup_hl),
         ("duplicate synthesis id", dup_syn),
         ("blank id", blank_id),
+        ("orphan progress", orphan_progress),
+        ("duplicate progress", dup_progress),
     ] {
         let err = dst.restore(&bad).await.unwrap_err();
         assert!(matches!(err, RepoError::Invalid(_)), "{name}: {err:?}");
         let now = export_library(dst).await.unwrap();
         assert!(now.articles.is_empty() && now.highlights.is_empty() && now.syntheses.is_empty(), "{name} left rows behind");
+        assert!(dst.get_progress(&good.progress[0].article_id).await.unwrap().is_none(), "{name} left progress behind");
     }
 
     // Still empty, so a good export loads afterwards.
@@ -516,6 +559,90 @@ async fn restoring_an_empty_export_is_fine_and_keeps_the_repo_empty(src: &dyn Re
     populate(src).await;
     dst.restore(&export_library(src).await.unwrap()).await.unwrap();
     assert_eq!(dst.list_articles(10, 0).await.unwrap().len(), 3);
+}
+
+async fn kind_author_and_url_lookup_roundtrip(repo: &dyn Repo) {
+    let web = article(repo, "https://x/w", "Web", "w").await;
+    assert_eq!((web.kind.as_str(), web.author.as_deref()), ("web", None));
+    let book = repo.upsert_article(new_book("urn:sha256:aa", "Book", "one two three")).await.unwrap();
+    assert_eq!((book.kind.as_str(), book.author.as_deref(), book.via.as_str()), ("book", Some("Ada Lovelace"), "epub"));
+    assert_eq!(repo.get_article(&book.id).await.unwrap(), Some(book.clone()));
+
+    assert_eq!(repo.get_article_by_url("urn:sha256:aa").await.unwrap(), Some(book.clone()));
+    assert_eq!(repo.get_article_by_url("https://x/w").await.unwrap(), Some(web.clone()));
+    assert!(repo.get_article_by_url("urn:sha256:zz").await.unwrap().is_none());
+
+    let listed = repo.list_articles(10, 0).await.unwrap();
+    let in_list = |id: &str| listed.iter().find(|s| s.id == id).unwrap().clone();
+    assert_eq!((in_list(&book.id).kind.as_str(), in_list(&book.id).author.as_deref()), ("book", Some("Ada Lovelace")));
+    assert_eq!((in_list(&web.id).kind.as_str(), in_list(&web.id).author), ("web", None));
+}
+
+async fn progress_is_replaced_clamped_and_shown_in_the_list(repo: &dyn Repo) {
+    let book = repo.upsert_article(new_book("urn:sha256:bb", "Book", "text")).await.unwrap();
+    let other = repo.upsert_article(new_book("urn:sha256:cc", "Other", "text")).await.unwrap();
+    assert!(repo.get_progress(&book.id).await.unwrap().is_none());
+    assert!(repo.get_progress("no-such-id").await.unwrap().is_none());
+    assert!(repo.list_articles(10, 0).await.unwrap().iter().all(|s| s.progress.is_none()));
+
+    let first = repo.put_progress(&book.id, "epubcfi(/6/2)", 0.1).await.unwrap();
+    assert_eq!((first.article_id.as_str(), first.position.as_str(), first.fraction), (book.id.as_str(), "epubcfi(/6/2)", 0.1));
+    assert_eq!(repo.get_progress(&book.id).await.unwrap(), Some(first.clone()));
+
+    let second = repo.put_progress(&book.id, "epubcfi(/6/8)", 7.0).await.unwrap();
+    assert_eq!(second.fraction, 1.0, "clamped");
+    assert!(second.updated_at >= first.updated_at);
+    assert_eq!(repo.get_progress(&book.id).await.unwrap(), Some(second));
+    assert_eq!(repo.put_progress(&book.id, "epubcfi(/6/8)", -3.0).await.unwrap().fraction, 0.0);
+    assert_eq!(repo.put_progress(&book.id, "epubcfi(/6/8)", f64::NAN).await.unwrap().fraction, 0.0);
+    repo.put_progress(&book.id, "epubcfi(/6/8)", 0.5).await.unwrap();
+
+    let listed = repo.list_articles(10, 0).await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.id == book.id).unwrap().progress, Some(0.5));
+    assert_eq!(listed.iter().find(|s| s.id == other.id).unwrap().progress, None);
+
+    assert!(matches!(repo.put_progress("no-such-id", "epubcfi(/6/2)", 0.1).await.unwrap_err(), RepoError::NotFound(_)));
+    for blank in ["", "  "] {
+        assert!(matches!(repo.put_progress(&book.id, blank, 0.1).await.unwrap_err(), RepoError::Invalid(_)));
+    }
+    assert_eq!(repo.get_progress(&book.id).await.unwrap().unwrap().fraction, 0.5);
+}
+
+async fn delete_removes_progress_and_book_highlights_but_not_others(repo: &dyn Repo) {
+    let a = repo.upsert_article(new_book("urn:sha256:dd", "A", "text")).await.unwrap();
+    let b = repo.upsert_article(new_book("urn:sha256:ee", "B", "text")).await.unwrap();
+    repo.put_progress(&a.id, "epubcfi(/6/2)", 0.3).await.unwrap();
+    repo.put_progress(&b.id, "epubcfi(/6/4)", 0.6).await.unwrap();
+    repo.add_highlight(NewHighlight { anchor: Some("epubcfi(/6/2!/4,/1:0,/1:3)".into()), ..new_highlight(&a.id, "one") })
+        .await
+        .unwrap();
+
+    repo.delete_article(&a.id).await.unwrap();
+    assert!(repo.get_progress(&a.id).await.unwrap().is_none());
+    assert!(repo.list_highlights(Some(&a.id)).await.unwrap().is_empty());
+    assert_eq!(repo.get_progress(&b.id).await.unwrap().unwrap().fraction, 0.6);
+    // A new article never inherits a deleted one's progress.
+    let again = repo.upsert_article(new_book("urn:sha256:dd", "A", "text")).await.unwrap();
+    assert!(repo.get_progress(&again.id).await.unwrap().is_none());
+    assert_eq!(export_library(repo).await.unwrap().progress.len(), 1);
+}
+
+async fn highlight_anchor_and_location_roundtrip(repo: &dyn Repo) {
+    let book = repo.upsert_article(new_book("urn:sha256:ff", "Book", "text")).await.unwrap();
+    let h = repo
+        .add_highlight(NewHighlight {
+            anchor: Some("epubcfi(/6/14!/4/2,/1:0,/1:27)".into()),
+            location: Some("Chapter \"Two\"".into()),
+            ..new_highlight(&book.id, "a passage")
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.anchor.as_deref(), Some("epubcfi(/6/14!/4/2,/1:0,/1:27)"));
+    assert_eq!(h.location.as_deref(), Some("Chapter \"Two\""));
+    let plain = repo.add_highlight(new_highlight(&book.id, "plain")).await.unwrap();
+    assert_eq!((plain.anchor.clone(), plain.location.clone()), (None, None));
+    assert_eq!(repo.list_highlights(Some(&book.id)).await.unwrap(), vec![h.clone(), plain]);
+    assert_eq!(repo.list_highlights(None).await.unwrap()[0], h);
 }
 
 async fn export_drops_deleted_articles_and_their_highlights(repo: &dyn Repo) {
@@ -568,6 +695,10 @@ macro_rules! contract_all {
             synthesis_roundtrip_list_is_newest_first_and_filters_by_kind,
             log_usage_accepts_any_json_detail,
             export_drops_deleted_articles_and_their_highlights,
+            kind_author_and_url_lookup_roundtrip,
+            progress_is_replaced_clamped_and_shown_in_the_list,
+            delete_removes_progress_and_book_highlights_but_not_others,
+            highlight_anchor_and_location_roundtrip,
         );
     };
 }
@@ -605,6 +736,20 @@ contract_all!(surreal, SurrealRepo::memory().await.unwrap());
 restore_all!(mem_restore, MemRepo::new());
 restore_all!(surreal_restore, SurrealRepo::memory().await.unwrap());
 
+#[test]
+fn an_export_from_before_books_still_loads() {
+    let old = r#"{"version":1,"exported_at":"2026-10-30T10:00:00Z",
+        "articles":[{"id":"a1","url":"https://x/1","title":"T","markdown":"m","words":1,"via":"manual","blob_key":null,
+                     "saved_at":"2026-10-30T10:00:00Z"}],
+        "highlights":[{"id":"h1","article_id":"a1","text":"t","note":null,"created_at":"2026-10-30T10:00:00Z"}],
+        "syntheses":[]}"#;
+    let export: LibraryExport = serde_json::from_str(old).unwrap();
+    assert_eq!((export.articles[0].kind.as_str(), export.articles[0].author.clone()), ("web", None));
+    assert_eq!((export.highlights[0].anchor.clone(), export.highlights[0].location.clone()), (None, None));
+    assert!(export.progress.is_empty());
+    validate_export(&export).unwrap();
+}
+
 // ------------------------------------------------- SurrealRepo-only
 
 #[tokio::test]
@@ -626,6 +771,8 @@ async fn surreal_data_survives_reopen() {
                 article_id: a.id.clone(),
                 text: "remember this".into(),
                 note: Some("n".into()),
+                anchor: Some("epubcfi(/6/2!/4,/1:0,/1:4)".into()),
+                location: None,
             })
             .await
             .unwrap();

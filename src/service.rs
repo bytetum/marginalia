@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, RunOutcome, new_conversation};
 pub use crate::agent::LlmConfig;
 use crate::domain::*;
+use crate::epub;
 use crate::extract::extract;
 use crate::repo::{BlobStore, Repo, RepoError, export_library};
 
@@ -91,13 +92,82 @@ impl App {
         }
         let article = self
             .repo
-            .upsert_article(NewArticle { url: url.into(), title: title.into(), markdown: markdown.into(), via: "manual".into(), blob_key: None })
+            .upsert_article(NewArticle { url: url.into(), title: title.into(), markdown: markdown.into(), via: "manual".into(), blob_key: None, kind: KIND_WEB.into(), author: None })
             .await?;
         self.log("save", json!({ "id": article.id, "via": "manual", "by": "user" })).await;
         Ok(article)
     }
 
+    /// Store an uploaded EPUB as a book. The article's url is `urn:sha256:<hex of the bytes>`, so uploading the same file
+    /// again changes nothing and returns the existing book with `false`. `Invalid` if the bytes are not a usable EPUB.
+    pub async fn save_book(&self, bytes: Vec<u8>, filename: Option<&str>) -> Result<(ArticleSummary, bool), AppError> {
+        use sha2::{Digest, Sha256};
+        let url = format!("urn:sha256:{}", hex::encode(Sha256::digest(&bytes)));
+        if let Some(existing) = self.repo.get_article_by_url(&url).await? {
+            return Ok((self.summary(existing).await?, false));
+        }
+        let filename = filename.map(str::to_string);
+        // Unzipping and converting a big book is CPU work; keep it off the async workers.
+        let (book, bytes) = tokio::task::spawn_blocking(move || epub::parse(&bytes, filename.as_deref()).map(|b| (b, bytes)))
+            .await
+            .map_err(|e| AppError::Upstream(format!("book parsing task failed: {e}")))?
+            .map_err(|e| AppError::Invalid(e.to_string()))?;
+        let blob_key = self.blobs.put(&bytes, "epub").await?;
+        let article = self
+            .repo
+            .upsert_article(NewArticle {
+                url,
+                title: book.title,
+                markdown: book.markdown,
+                via: "epub".into(),
+                blob_key: Some(blob_key),
+                kind: KIND_BOOK.into(),
+                author: book.author,
+            })
+            .await?;
+        self.log("save", json!({ "id": article.id, "via": "epub", "by": "user" })).await;
+        Ok((self.summary(article).await?, true))
+    }
+
+    /// The stored EPUB of a book. `NotFound` if the article is missing or has no EPUB.
+    pub async fn book_file(&self, article_id: &str) -> Result<Vec<u8>, AppError> {
+        let article = self
+            .repo
+            .get_article(article_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("no article with id {article_id}")))?;
+        let key = article.blob_key.filter(|k| k.ends_with(".epub")).ok_or_else(|| AppError::NotFound(format!("article {article_id} has no EPUB file")))?;
+        self.blobs.get(&key).await?.ok_or_else(|| AppError::NotFound(format!("the EPUB file of article {article_id} is missing")))
+    }
+
+    async fn summary(&self, a: Article) -> Result<ArticleSummary, AppError> {
+        Ok(ArticleSummary {
+            highlight_count: self.repo.list_highlights(Some(&a.id)).await?.len() as u32,
+            progress: self.repo.get_progress(&a.id).await?.map(|p| p.fraction),
+            id: a.id,
+            url: a.url,
+            title: a.title,
+            words: a.words,
+            via: a.via,
+            saved_at: a.saved_at,
+            kind: a.kind,
+            author: a.author,
+        })
+    }
+
     pub async fn add_highlight(&self, article_id: &str, text: &str, note: Option<&str>) -> Result<Highlight, AppError> {
+        self.add_highlight_at(article_id, text, note, None, None).await
+    }
+
+    /// Like `add_highlight`, for a passage in a book: `anchor` is its EPUB CFI and `location` a chapter label.
+    pub async fn add_highlight_at(
+        &self,
+        article_id: &str,
+        text: &str,
+        note: Option<&str>,
+        anchor: Option<&str>,
+        location: Option<&str>,
+    ) -> Result<Highlight, AppError> {
         if article_id.trim().is_empty() {
             return Err(AppError::Invalid("article_id is blank".into()));
         }
@@ -105,9 +175,16 @@ impl App {
             return Err(AppError::Invalid("highlight text is blank".into()));
         }
         let note = note.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        let optional = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let highlight = self
             .repo
-            .add_highlight(NewHighlight { article_id: article_id.trim().into(), text: text.into(), note })
+            .add_highlight(NewHighlight {
+                article_id: article_id.trim().into(),
+                text: text.into(),
+                note,
+                anchor: optional(anchor),
+                location: optional(location),
+            })
             .await?;
         self.log("highlight", json!({ "id": highlight.id, "article_id": highlight.article_id, "by": "user" })).await;
         Ok(highlight)
@@ -207,7 +284,12 @@ impl App {
         self.repo.restore(&export).await?;
         self.log(
             "import",
-            json!({ "articles": export.articles.len(), "highlights": export.highlights.len(), "syntheses": export.syntheses.len() }),
+            json!({
+                "articles": export.articles.len(),
+                "highlights": export.highlights.len(),
+                "syntheses": export.syntheses.len(),
+                "progress": export.progress.len(),
+            }),
         )
         .await;
         Ok(())
@@ -250,7 +332,7 @@ pub(crate) async fn save_url_with(
         None => None,
     };
     let article = repo
-        .upsert_article(NewArticle { url: url.into(), title: got.title, markdown: got.markdown, via: got.via.as_str().into(), blob_key })
+        .upsert_article(NewArticle { url: url.into(), title: got.title, markdown: got.markdown, via: got.via.as_str().into(), blob_key, kind: KIND_WEB.into(), author: None })
         .await?;
     let _ = repo.log_usage("save", json!({ "id": article.id, "via": article.via, "by": by })).await;
     Ok(article)
