@@ -57,7 +57,7 @@ the setup screen.
 - Capabilities (`src-tauri/capabilities`): event listen/unlisten, `opener:allow-open-url` for `https://*` and
   `http://*`, and on mobile `mobile-sharetarget:allow-pop-intent-queue`. The token commands are the app's own and need
   no plugin permission. There is no shell, fs or http plugin.
-- CSP: `default-src 'none'`, scripts and styles from the app only, images from anywhere (articles link them).
+- CSP: `default-src 'none'`, scripts from the app only (`script-src 'self'`: no `blob:`, no inline, so scripts inside an EPUB cannot run), styles from the app plus inline and `blob:` (book sections are `blob:` iframes), images from anywhere (articles link them).
   `connect-src` is `ipc: http://ipc.localhost https: http:`. It cannot name the server because the URL is typed at run
   time; script injection is what the CSP and the server's HTML sanitiser are there to stop, and the page loads no third
   party script.

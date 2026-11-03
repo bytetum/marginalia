@@ -2,6 +2,8 @@
 // on a device the server recognises as the owner's (Tailscale identity, see probeTailscale); the only HTML ever
 // inserted with innerHTML is what the server sanitised (/articles/{id}/html).
 //
+// Books (kind "book", EPUB) open in a full-bleed reader built on the vendored foliate-js (see the "books" section).
+//
 // The same files run in two places:
 //   - the browser page served by the server itself: API calls are same-origin (API_BASE is ''), and the token lives in
 //     localStorage;
@@ -98,13 +100,18 @@
   // The one place that talks to the server: adds the base URL and the bearer token (none on a Tailscale-recognised
   // device: the Authorization header is left out). A network failure becomes a readable Error (browsers say "Failed
   // to fetch" or "Load failed").
-  async function request(base, token, path, { json, method, timeout } = {}) {
-    const init = { method: method || (json === undefined ? 'GET' : 'POST'), headers: {} };
+  // `body` (a Blob/File, sent as is, with `headers`) is for the EPUB upload; `keepalive` lets the last progress save
+  // outlive a closing page.
+  async function request(base, token, path, { json, method, timeout, body, headers, keepalive } = {}) {
+    const init = { method: method || (json === undefined && body === undefined ? 'GET' : 'POST'), headers: { ...headers } };
     if (token) init.headers.Authorization = 'Bearer ' + token;
     if (json !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(json);
+    } else if (body !== undefined) {
+      init.body = body;
     }
+    if (keepalive) init.keepalive = true;
     if (timeout && typeof AbortSignal.timeout === 'function') init.signal = AbortSignal.timeout(timeout);
     try {
       return await fetch(base + path, init);
@@ -123,16 +130,18 @@
     return msg;
   }
 
-  async function api(path, { json, method } = {}) {
+  // `blob: true` returns the body as a Blob (the EPUB file) instead of parsing it by content type.
+  async function api(path, { json, method, body, headers, keepalive, blob } = {}) {
     const token = getToken();
     if (!token && !tokenless) throw new AuthError(NEEDED);
-    const res = await request(API_BASE, token, path, { json, method });
+    const res = await request(API_BASE, token, path, { json, method, body, headers, keepalive });
     if (res.status === 401) {
       await clearToken();
       tokenless = false; // show the token form rather than retry the same unauthorised request
       throw new AuthError(token ? REJECTED : NEEDED);
     }
     if (!res.ok) throw new Error(await errorMessage(res));
+    if (blob) return res.blob();
     return (res.headers.get('content-type') || '').includes('json') ? res.json() : res.text();
   }
 
@@ -279,9 +288,12 @@
   // ---------- library ----------
 
   function articleItem(a) {
-    const bits = [host(a.url), a.words + ' words', a.highlight_count + (a.highlight_count === 1 ? ' highlight' : ' highlights'), fmtDate(a.saved_at)];
+    const book = a.kind === 'book';
+    const bits = [book ? a.author : host(a.url), book && typeof a.progress === 'number' ? Math.round(a.progress * 100) + '% read' : '',
+      a.words + ' words', a.highlight_count + (a.highlight_count === 1 ? ' highlight' : ' highlights'), fmtDate(a.saved_at)];
     return h('li', null, h('a', { class: 'item', href: '#/a/' + encodeURIComponent(a.id) },
-      h('span', { class: 'title' }, a.title), h('span', { class: 'meta' }, bits.filter(Boolean).join(' · '))));
+      h('span', { class: 'title' }, book ? h('span', { class: 'tag' }, 'Book') : null, a.title),
+      h('span', { class: 'meta' }, bits.filter(Boolean).join(' · '))));
   }
 
   function hitItem(hit) {
@@ -311,6 +323,31 @@
       }
     } }, saveInput, saveBtn);
 
+    // Add book: the raw EPUB is the request body (no multipart). fetch has no upload progress events, so the status
+    // names the file and its size and shows an indeterminate bar until the server answers.
+    const bookInput = h('input', { type: 'file', accept: '.epub,application/epub+zip', hidden: true, 'aria-label': 'EPUB file' });
+    const bookBtn = h('button', { type: 'button', class: 'secondary' }, 'Add book');
+    const bookStatus = h('p', { class: 'status muted', 'aria-live': 'polite' });
+    bookBtn.addEventListener('click', () => bookInput.click());
+    bookInput.addEventListener('change', async () => {
+      const file = bookInput.files[0];
+      bookInput.value = '';
+      if (!file) return;
+      bookBtn.disabled = true;
+      bookStatus.className = 'status muted';
+      bookStatus.replaceChildren(h('progress', { 'aria-label': 'Uploading' }), ' Uploading ' + file.name + ' (' + (file.size / 1048576).toFixed(1) + ' MB) and indexing it...');
+      try {
+        const book = await api('/books', { body: file, headers: { 'Content-Type': 'application/epub+zip', 'X-Filename': encodeURIComponent(file.name) } });
+        bookCachePut(book.id, file);
+        location.hash = '#/a/' + encodeURIComponent(book.id);
+      } catch (e) {
+        if (e instanceof AuthError) return showLogin(e.message);
+        bookStatus.className = 'status error';
+        bookStatus.textContent = 'Could not add the book: ' + e.message;
+        bookBtn.disabled = false;
+      }
+    });
+
     const searchInput = h('input', { type: 'search', placeholder: 'Search the library', 'aria-label': 'Search', enterkeyhint: 'search' });
     const results = h('div');
     let timer = 0;
@@ -333,7 +370,7 @@
     searchInput.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(runSearch, 300); });
 
     const listBox = h('div', null, h('p', { class: 'muted' }, 'Loading...'));
-    show(h('h1', null, 'Library'), saveForm, saveStatus, searchForm, results, listBox);
+    show(h('h1', null, 'Library'), saveForm, saveStatus, h('div', { class: 'row' }, bookBtn), bookInput, bookStatus, searchForm, results, listBox);
 
     const list = h('ul', { class: 'list' });
     const moreBtn = h('button', { type: 'button', class: 'secondary' }, 'Show more');
@@ -346,7 +383,7 @@
       list.append(...rows.map(articleItem));
       moreBtn.hidden = rows.length < PAGE;
       moreBtn.disabled = false;
-      if (offset === 0) listBox.replaceChildren(h('p', { class: 'muted' }, 'Nothing saved yet. Paste a URL above.'));
+      if (offset === 0) listBox.replaceChildren(h('p', { class: 'muted' }, 'Nothing saved yet. Paste a URL or add a book above.'));
       else listBox.replaceChildren(list, moreBtn);
     };
     moreBtn.addEventListener('click', () => loadPage().catch((e) => results.replaceChildren(errorNode(e))));
@@ -425,9 +462,17 @@
   async function readerView(id, my) {
     show(h('p', { class: 'muted' }, 'Loading...'));
     const q = encodeURIComponent(id);
-    const [article, html, highlights] = await Promise.all([
-      api('/articles/' + q), api('/articles/' + q + '/html'), api('/articles/' + q + '/highlights'),
-    ]);
+    // All three start at once; a book has no /html, so that request is dropped when the article turns out to be one.
+    const htmlReq = api('/articles/' + q + '/html');
+    const hlReq = api('/articles/' + q + '/highlights');
+    const article = await api('/articles/' + q).catch((e) => { htmlReq.catch(() => {}); hlReq.catch(() => {}); throw e; });
+    if (article.kind === 'book') {
+      htmlReq.catch(() => {});
+      const highlights = await hlReq;
+      if (my !== nav) return;
+      return bookView(article, highlights, my);
+    }
+    const [html, highlights] = await Promise.all([htmlReq, hlReq]);
     if (my !== nav) return;
 
     const body = h('div', { class: 'article' });
@@ -524,10 +569,15 @@
     const save = h('button', { type: 'submit' }, 'Save');
     const form = h('form', { class: 'row', onsubmit: async (ev) => {
       ev.preventDefault();
-      if (!reader) return;
+      if (!reader && !book) return;
       save.disabled = true;
       err.textContent = '';
       try {
+        if (book) { // a book's highlight carries its CFI anchor and chapter; the text is drawn in place, no reload
+          await book.saveSelection(note.value.trim() || null);
+          hidePop();
+          return;
+        }
         await api('/articles/' + encodeURIComponent(reader.id) + '/highlights', { json: { text: pending, note: note.value.trim() || null } });
         const y = window.scrollY;
         hidePop();
@@ -539,13 +589,14 @@
         err.textContent = e.message;
         save.disabled = false;
       }
-    } }, note, save, h('button', { type: 'button', class: 'secondary', onclick: () => { hidePop(); window.getSelection().removeAllRanges(); } }, 'Cancel'));
+    } }, note, save, h('button', { type: 'button', class: 'secondary', onclick: () => { hidePop(); if (book) book.view.deselect(); else window.getSelection().removeAllRanges(); } }, 'Cancel'));
     pop.replaceChildren(form, err);
     placePop(rect);
     note.focus();
   }
 
   function onSelectionSettled() {
+    if (book) return; // inside a book the selection lives in the section's iframe (bookSelectionSettled)
     if (popBusy || mouseDown || Date.now() < popHoldUntil) return;
     const sel = window.getSelection();
     if (!reader || !sel || sel.rangeCount === 0 || sel.isCollapsed) return hidePop();
@@ -567,6 +618,610 @@
   document.addEventListener('pointerup', (ev) => { if (ev.pointerType === 'mouse' && mouseDown) { mouseDown = false; settleSoon(0); } });
   document.addEventListener('pointercancel', () => { mouseDown = false; });
   window.addEventListener('blur', () => { mouseDown = false; });
+
+  // ---------- books (EPUB reader) ----------
+  //
+  // Books are articles with kind "book". foliate-js (web/vendor/foliate-js, MIT) parses the EPUB and renders each
+  // section into an iframe; it is loaded on demand with a relative import(), so it works from the server and from the
+  // Tauri bundle alike. The EPUB comes from GET /articles/{id}/file through api() (so it carries the bearer token or none
+  // on a Tailscale device, never a URL token) and is kept in IndexedDB, content-addressed by article id. Scripts inside
+  // an EPUB cannot run: the page CSP has script-src 'self' without blob:, which the section iframes inherit, and
+  // script resources are refused in the loader as well.
+  //
+  // Positions are EPUB CFIs. Progress {position, fraction} is PUT to /articles/{id}/progress (debounced, flushed when the
+  // page is hidden). A highlight's anchor is the CFI of the selected range (view.getCFI), drawn with view.addAnnotation.
+
+  const READER_KEY = 'marginalia.reader'; // reading settings, per device
+  const DEFAULT_SETTINGS = { flow: 'paginated', theme: 'auto', font: 'publisher', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'publisher', hyphenate: true };
+  const THEMES = { // book page colours; the app chrome follows through #book[data-theme] in app.css
+    light: { bg: '#fbfaf7', fg: '#1d1d1b', link: '#1a5fb4' },
+    dark: { bg: '#17171a', fg: '#e6e4dc', link: '#7db2f5' },
+    sepia: { bg: '#f4ecd8', fg: '#5b4636', link: '#8a4b12' },
+  };
+  const MARGINS = { narrow: { gap: '3%', margin: '28px' }, medium: { gap: '7%', margin: '48px' }, wide: { gap: '12%', margin: '64px' } };
+  const FONTS = {
+    serif: 'Georgia, "Iowan Old Style", Cambria, "Times New Roman", serif',
+    sans: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+  };
+  const HIGHLIGHT_COLOR = '#f2b705';
+  const BARS_MS = 3500; // how long the toolbars stay after the last interaction
+  const SAVE_MS = 2000; // progress debounce
+  const CACHE_BOOKS = 6; // EPUBs kept in IndexedDB
+
+  let book = null; // {id, view, saveSelection, destroy} while a book is open
+
+  function loadSettings() {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(READER_KEY)) || {}; } catch (_) { /* keep the defaults */ }
+    const s = { ...DEFAULT_SETTINGS, ...saved };
+    s.size = Math.min(34, Math.max(12, +s.size || DEFAULT_SETTINGS.size));
+    s.line = Math.min(2.2, Math.max(1.1, +s.line || DEFAULT_SETTINGS.line));
+    if (!MARGINS[s.margin]) s.margin = DEFAULT_SETTINGS.margin;
+    if (s.columns !== 1) s.columns = 2;
+    return s;
+  }
+
+  // ----- IndexedDB cache of the EPUB files (best effort: any failure just means a download) -----
+
+  function idb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('marginalia', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('books');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function bookCacheGet(id) {
+    try {
+      const db = await idb();
+      return await new Promise((resolve, reject) => {
+        const req = db.transaction('books').objectStore('books').get(id);
+        req.onsuccess = () => resolve(req.result ? req.result.blob : null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (_) { return null; }
+  }
+
+  async function bookCachePut(id, blob) {
+    try {
+      const db = await idb();
+      const store = db.transaction('books', 'readwrite').objectStore('books');
+      store.put({ blob, at: Date.now() }, id);
+      const seen = [];
+      store.openCursor().onsuccess = (ev) => { // keys and times only: the blobs are not read
+        const cur = ev.target.result;
+        if (cur) { seen.push([cur.key, cur.value.at]); cur.continue(); return; }
+        seen.sort((a, b) => b[1] - a[1]);
+        for (const [key] of seen.slice(CACHE_BOOKS)) store.delete(key);
+      };
+    } catch (_) { /* not cached */ }
+  }
+
+  let foliate = null;
+  function loadFoliate() {
+    if (!foliate) {
+      foliate = Promise.all([import('./vendor/foliate-js/view.js'), import('./vendor/foliate-js/overlayer.js'), import('./vendor/foliate-js/footnotes.js')])
+        .then(([, o, f]) => ({ Overlayer: o.Overlayer, FootnoteHandler: f.FootnoteHandler }))
+        .catch((e) => { foliate = null; throw new Error('Could not load the EPUB reader: ' + (e.message || e)); });
+    }
+    return foliate;
+  }
+
+  // Style sheet injected into every section (renderer.setStyles). Light keeps the book's own colours on a light page;
+  // dark and sepia force colours so text stays readable.
+  function readerCSS(c, theme) {
+    const t = THEMES[theme];
+    const family = FONTS[c.font];
+    const align = c.align === 'publisher' ? '' : 'text-align: ' + (c.align === 'justify' ? 'justify' : 'start') + ' !important;';
+    const hyph = c.hyphenate ? 'auto' : 'manual';
+    return `
+      @namespace epub "http://www.idpf.org/2007/ops";
+      html { color-scheme: ${theme === 'dark' ? 'dark' : 'light'}; background: ${t.bg} !important; color: ${t.fg} !important; font-size: ${c.size}px !important; }
+      body { background: transparent !important; color: ${t.fg} !important; }
+      ${theme === 'light' ? '' : 'body * { color: inherit !important; background-color: transparent !important; }'}
+      a:link, a:visited, a:link *, a:visited * { color: ${t.link} !important; }
+      ${family ? `body, body *:not(pre):not(code):not(kbd):not(samp):not(tt) { font-family: ${family} !important; }` : ''}
+      p, li, blockquote, dd {
+        line-height: ${c.line} !important;
+        ${align}
+        -webkit-hyphens: ${hyph}; hyphens: ${hyph};
+        -webkit-hyphenate-limit-before: 3; -webkit-hyphenate-limit-after: 2;
+        widows: 2; orphans: 2;
+      }
+      pre { white-space: pre-wrap !important; }
+      aside[epub|type~="endnote"], aside[epub|type~="footnote"], aside[epub|type~="note"], aside[epub|type~="rearnote"] { display: none; }
+    `;
+  }
+
+  // Rectangle of something inside a section iframe, in page coordinates (what placePop expects).
+  function pageRect(doc, r) {
+    const fr = doc.defaultView && doc.defaultView.frameElement;
+    const o = fr ? fr.getBoundingClientRect() : { left: 0, top: 0 };
+    return { left: r.left + o.left, right: r.right + o.left, top: r.top + o.top, bottom: r.bottom + o.top };
+  }
+
+  function closeBook() {
+    if (book) book.destroy();
+    book = null;
+    document.body.classList.remove('reading');
+  }
+
+  async function bookView(article, highlights, my) {
+    const id = article.id;
+    const q = encodeURIComponent(id);
+    const status = h('p', { class: 'muted', 'aria-live': 'polite' }, 'Opening the book...');
+    show(h('p', null, h('a', { href: '#/' }, '← Library')), h('h1', null, article.title), status);
+
+    const lib = loadFoliate();
+    lib.catch(() => {});
+    let blob = await bookCacheGet(id);
+    if (!blob) {
+      status.textContent = 'Downloading the book...';
+      blob = await api('/articles/' + q + '/file', { blob: true });
+      bookCachePut(id, blob);
+    }
+    let progress = null;
+    let syncOn = true; // false when the saved position could not be read: do not overwrite it
+    try {
+      progress = await api('/articles/' + q + '/progress');
+    } catch (e) {
+      if (e instanceof AuthError) throw e;
+      syncOn = false;
+    }
+    const { Overlayer, FootnoteHandler } = await lib;
+    if (my !== nav) return;
+
+    const cfg = loadSettings();
+    const view = document.createElement('foliate-view');
+    const hls = highlights.slice();
+    const hlIndex = new Map(); // highlight -> section index, for those with an anchor that resolves
+    const cleanups = [];
+    const listen = (target, type, fn, opts) => { target.addEventListener(type, fn, opts); cleanups.push(() => target.removeEventListener(type, fn, opts)); };
+
+    // ----- chrome -----
+    const iconBtn = (label, text, onclick) => h('button', { type: 'button', class: 'tb', 'aria-label': label, title: label, onclick }, text);
+    const title = h('span', { class: 'book-title' }, article.title);
+    const hlBtn = iconBtn('Highlights and notes', 'Notes', () => openPanel('highlights', hlBtn));
+    const top = h('div', { class: 'book-top' },
+      h('a', { class: 'tb', href: '#/', 'aria-label': 'Back to the library', title: 'Library' }, '‹'), title,
+      iconBtn('Table of contents', '☰', function () { openPanel('toc', this); }),
+      iconBtn('Search in the book', 'Find', function () { openPanel('search', this); }),
+      hlBtn,
+      iconBtn('Reading settings', 'Aa', function () { openPanel('settings', this); }));
+    const chapterEl = h('span', { class: 'book-chapter' });
+    const percentEl = h('span', { class: 'book-percent' });
+    const slider = h('input', { type: 'range', min: 0, max: 1, step: 'any', value: 0, class: 'book-slider', 'aria-label': 'Position in the book', list: 'book-ticks' });
+    const ticks = h('datalist', { id: 'book-ticks' });
+    const bottom = h('div', { class: 'book-bottom' },
+      h('div', { class: 'book-where' }, chapterEl, percentEl),
+      h('div', { class: 'book-seek' }, iconBtn('Previous page', '‹', () => view.goLeft()), slider, ticks, iconBtn('Next page', '›', () => view.goRight())));
+    const backBtn = h('button', { type: 'button', class: 'book-back', hidden: true, onclick: () => view.history.back() }, '← Back');
+    const stage = h('div', { class: 'book-stage' }, view);
+    const sheet = h('div', { class: 'book-sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
+    const scrim = h('div', { class: 'book-scrim', hidden: true, onclick: () => closePanel() });
+    const fnBox = h('div', { class: 'book-fn', role: 'dialog', 'aria-label': 'Note', hidden: true });
+    const root = h('div', { id: 'book', class: 'book bars' }, stage, top, bottom, backBtn, scrim, sheet, fnBox);
+    document.body.append(root);
+    document.body.classList.add('reading');
+
+    // ----- toolbars -----
+    let barsTimer = 0;
+    const barsOn = () => root.classList.contains('bars');
+    function hideBars() {
+      clearTimeout(barsTimer);
+      if (sheet.hidden) root.classList.remove('bars');
+    }
+    function showBars() {
+      root.classList.add('bars');
+      clearTimeout(barsTimer);
+      barsTimer = setTimeout(() => {
+        if (!top.matches(':hover') && !bottom.matches(':hover')) hideBars();
+        else showBars();
+      }, BARS_MS);
+    }
+    const toggleBars = () => (barsOn() ? hideBars() : showBars());
+    for (const el of [top, bottom]) el.addEventListener('pointerdown', () => { if (barsOn()) showBars(); });
+    showBars();
+
+    // ----- settings -----
+    const dark = window.matchMedia('(prefers-color-scheme: dark)');
+    const theme = () => (cfg.theme === 'auto' ? (dark.matches ? 'dark' : 'light') : cfg.theme);
+    function applySettings() {
+      root.dataset.theme = theme();
+      const r = view.renderer;
+      if (!r) return;
+      const m = MARGINS[cfg.margin];
+      r.setAttribute('flow', cfg.flow);
+      r.setAttribute('gap', m.gap);
+      r.setAttribute('margin', m.margin);
+      r.setAttribute('max-column-count', String(cfg.columns));
+      r.setStyles && r.setStyles(readerCSS(cfg, theme()));
+    }
+    const saveSettings = () => { try { localStorage.setItem(READER_KEY, JSON.stringify(cfg)); } catch (_) { /* private mode */ } };
+    const onScheme = () => { if (cfg.theme === 'auto') applySettings(); };
+    dark.addEventListener('change', onScheme);
+    cleanups.push(() => dark.removeEventListener('change', onScheme));
+    root.dataset.theme = theme();
+
+    // ----- progress sync -----
+    let cur = null; // {cfi, fraction} of the page on screen
+    let saved = progress ? progress.position : null; // last position the server has
+    let saveTimer = 0;
+    function pushProgress(keepalive) {
+      clearTimeout(saveTimer);
+      if (!syncOn || !cur || cur.cfi === saved || (!progress && !saved && cur.fraction < 0.001)) return;
+      const before = saved;
+      saved = cur.cfi;
+      // fetch starts synchronously inside api(), which a keepalive request needs while the page is closing
+      api('/articles/' + q + '/progress', { method: 'PUT', json: { position: cur.cfi, fraction: cur.fraction }, keepalive })
+        .catch(() => { if (saved === cur.cfi) saved = before; });
+    }
+    const flush = () => pushProgress(true);
+    listen(document, 'visibilitychange', () => { if (document.hidden) flush(); });
+    listen(window, 'pagehide', flush);
+
+    // ----- panels -----
+    let panel = null;
+    let opener = null;
+    function closePanel() {
+      if (!panel) return;
+      panel = null;
+      sheet.hidden = scrim.hidden = true;
+      sheet.replaceChildren();
+      if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+      showBars();
+    }
+    function openPanel(name, from) {
+      hidePop();
+      opener = from || opener;
+      panel = name;
+      clearTimeout(barsTimer);
+      const builders = { toc: tocPanel, search: searchPanel, highlights: highlightsPanel, settings: settingsPanel };
+      const [heading, content] = builders[name]();
+      const close = h('button', { type: 'button', class: 'secondary', onclick: () => closePanel() }, 'Close');
+      sheet.setAttribute('aria-label', heading);
+      sheet.replaceChildren(h('div', { class: 'sheet-head' }, h('h2', null, heading), close), h('div', { class: 'sheet-body' }, content));
+      sheet.hidden = scrim.hidden = false;
+      const first = sheet.querySelector('input[type=search], .toc-cur, .sheet-body button, .sheet-body input') || close;
+      first.focus({ preventScroll: true });
+      if (name === 'toc') { const c = sheet.querySelector('.toc-cur'); if (c) c.scrollIntoView({ block: 'center' }); }
+    }
+    const jump = (target) => { closePanel(); hideBars(); return view.goTo(target); };
+
+    // Table of contents (nested)
+    let currentHref = null;
+    function tocList(items) {
+      return h('ul', { class: 'toc' }, items.map((it) => h('li', null,
+        h('button', { type: 'button', class: 'toc-item' + (it.href && it.href === currentHref ? ' toc-cur' : ''), 'aria-current': it.href && it.href === currentHref ? 'location' : null,
+          onclick: () => jump(it.href) }, (it.label || '').trim() || 'Untitled'),
+        it.subitems && it.subitems.length ? tocList(it.subitems) : null)));
+    }
+    function tocPanel() {
+      const toc = view.book.toc || [];
+      return ['Contents', toc.length ? tocList(toc) : h('p', { class: 'muted' }, 'This book has no table of contents.')];
+    }
+
+    // Search: results grouped by chapter, matches outlined in the text until cleared
+    let searchState = { query: '', box: null };
+    let searchSeq = 0;
+    function searchPanel() {
+      const input = h('input', { type: 'search', placeholder: 'Search in this book', 'aria-label': 'Search in this book', enterkeyhint: 'search', value: searchState.query });
+      const bar = h('progress', { max: 1, value: 0, hidden: true, 'aria-label': 'Search progress' });
+      const info = h('p', { class: 'status muted', 'aria-live': 'polite' });
+      const results = searchState.box || h('div', { class: 'results' });
+      searchState.box = results;
+      const clear = h('button', { type: 'button', class: 'secondary', onclick: () => {
+        searchSeq++;
+        view.clearSearch();
+        searchState = { query: '', box: null };
+        results.replaceChildren();
+        input.value = '';
+        info.textContent = '';
+        bar.hidden = true;
+        input.focus();
+      } }, 'Clear');
+      const run = async () => {
+        const query = input.value.trim();
+        const seq = ++searchSeq;
+        results.replaceChildren();
+        searchState.query = query;
+        if (!query) { view.clearSearch(); info.textContent = ''; return; }
+        info.textContent = 'Searching...';
+        bar.hidden = false;
+        let count = 0;
+        try {
+          for await (const r of view.search({ query })) {
+            if (seq !== searchSeq) return;
+            if (r === 'done') break;
+            if (r.progress != null) { bar.value = r.progress; continue; }
+            if (!r.subitems) continue;
+            count += r.subitems.length;
+            results.append(h('h3', null, r.label || 'Untitled'),
+              h('ul', { class: 'hits' }, r.subitems.map((s) => h('li', null,
+                h('button', { type: 'button', class: 'hit', onclick: () => jump(s.cfi) },
+                  s.excerpt.pre, h('mark', null, s.excerpt.match), s.excerpt.post)))));
+            info.textContent = 'Searching... ' + count + ' found';
+            if (count >= 500) break;
+          }
+          if (seq === searchSeq) info.textContent = count ? count + (count >= 500 ? '+' : '') + ' matches' : 'No matches.';
+        } catch (e) {
+          if (seq === searchSeq) info.textContent = 'Search failed: ' + e.message;
+        } finally {
+          if (seq === searchSeq) bar.hidden = true;
+        }
+      };
+      const form = h('form', { class: 'row', role: 'search', onsubmit: (ev) => { ev.preventDefault(); run(); } }, input, h('button', { type: 'submit' }, 'Search'), clear);
+      return ['Search', [form, bar, info, results]];
+    }
+
+    // Highlights and notes
+    function highlightsPanel() {
+      if (!hls.length) return ['Highlights', h('p', { class: 'muted' }, 'Select text in the book to highlight it, with an optional note.')];
+      const rows = hls.map((hl) => {
+        const body = [
+          hl.location ? h('div', { class: 'meta' }, hl.location) : null,
+          h('div', { class: 'quote' }, hl.text),
+          hl.note ? h('div', { class: 'note' }, hl.note) : null,
+        ];
+        return h('li', null, hl.anchor && hlIndex.has(hl)
+          ? h('button', { type: 'button', class: 'hl-row', onclick: () => jump(hl.anchor) }, body)
+          : h('div', { class: 'hl-row' }, body, h('div', { class: 'meta' }, 'No position in the book (added elsewhere).')));
+      });
+      return ['Highlights (' + hls.length + ')', h('ul', { class: 'highlights' }, rows)];
+    }
+
+    // Settings
+    function settingsPanel() {
+      const set = (key, value) => { cfg[key] = value; saveSettings(); applySettings(); };
+      const seg = (label, key, options) => {
+        const btns = options.map(([text, value]) => h('button', { type: 'button', class: 'secondary', 'aria-pressed': String(cfg[key] === value), onclick: () => {
+          set(key, value);
+          btns.forEach((b, i) => b.setAttribute('aria-pressed', String(options[i][1] === value)));
+        } }, text));
+        return h('div', { class: 'set-row', role: 'group', 'aria-label': label }, h('span', { class: 'set-label' }, label), h('div', { class: 'seg' }, btns));
+      };
+      const range = (label, key, min, max, step, fmt) => {
+        const out = h('output', null, fmt(cfg[key]));
+        const input = h('input', { type: 'range', min, max, step, value: cfg[key], 'aria-label': label, oninput: () => {
+          out.textContent = fmt(+input.value);
+          set(key, +input.value);
+        } });
+        return h('div', { class: 'set-row' }, h('span', { class: 'set-label' }, label), h('div', { class: 'slide' }, input, out));
+      };
+      const hyph = h('input', { type: 'checkbox', checked: cfg.hyphenate, id: 'set-hyph', onchange: () => set('hyphenate', hyph.checked) });
+      return ['Reading settings', [
+        seg('Layout', 'flow', [['Paginated', 'paginated'], ['Scrolled', 'scrolled']]),
+        seg('Theme', 'theme', [['Auto', 'auto'], ['Light', 'light'], ['Dark', 'dark'], ['Sepia', 'sepia']]),
+        seg('Font', 'font', [['Publisher', 'publisher'], ['Serif', 'serif'], ['Sans', 'sans']]),
+        range('Font size', 'size', 12, 34, 1, (v) => v + ' px'),
+        range('Line height', 'line', 1.1, 2.2, 0.05, (v) => v.toFixed(2)),
+        seg('Margins', 'margin', [['Narrow', 'narrow'], ['Medium', 'medium'], ['Wide', 'wide']]),
+        seg('Columns (wide screens)', 'columns', [['1', 1], ['2', 2]]),
+        seg('Alignment', 'align', [['Publisher', 'publisher'], ['Left', 'start'], ['Justified', 'justify']]),
+        h('div', { class: 'set-row' }, h('label', { for: 'set-hyph', class: 'set-label' }, 'Hyphenation'), hyph),
+      ]];
+    }
+
+    // ----- highlights in the text -----
+    function indexHighlight(hl) {
+      if (!hl.anchor) return;
+      try {
+        const r = view.resolveNavigation(hl.anchor);
+        if (r && typeof r.index === 'number') hlIndex.set(hl, r.index);
+      } catch (_) { /* stays in the panel only */ }
+    }
+    const hlByAnchor = (value) => hls.find((hl) => hl.anchor === value);
+    let annotationAt = 0; // a tap on a highlight must not also count as a tap on the page
+
+    let sel = null; // {text, cfi, location} of the current selection, kept because tapping the popover can clear it
+    function bookSelectionSettled(doc, index) {
+      if (popBusy || mouseDown || Date.now() < popHoldUntil) return;
+      const s = doc.getSelection();
+      if (!s || s.rangeCount === 0 || s.isCollapsed) return hidePop();
+      const range = s.getRangeAt(0);
+      const text = s.toString().trim();
+      if (!text) return hidePop();
+      let cfi = null;
+      let location = null;
+      try {
+        cfi = view.getCFI(index, range);
+        const item = view.getProgressOf(index, range).tocItem;
+        location = item && item.label ? item.label.trim() : null;
+      } catch (e) { console.error(e); }
+      sel = { text: text.slice(0, 5000), cfi, location };
+      pending = sel.text;
+      showPopButton(pageRect(doc, range.getBoundingClientRect()));
+    }
+
+    async function saveSelection(note) {
+      if (!sel) return;
+      const s = sel;
+      const res = await api('/articles/' + q + '/highlights', { json: { text: s.text, note, anchor: s.cfi, location: s.location } });
+      const hl = { text: s.text, note, anchor: s.cfi, location: s.location, ...(res && typeof res === 'object' ? res : {}) };
+      hls.push(hl);
+      indexHighlight(hl);
+      if (hl.anchor && hlIndex.has(hl)) view.addAnnotation({ value: hl.anchor });
+      view.deselect();
+      sel = null;
+    }
+
+    function showNote(hl, range) {
+      const doc = range.startContainer.ownerDocument;
+      popBusy = true;
+      pop.replaceChildren(
+        h('div', { class: 'hl-note' }, hl.note ? hl.note : h('span', { class: 'muted' }, 'No note on this highlight.')),
+        h('button', { type: 'button', class: 'secondary', onclick: () => hidePop() }, 'Close'));
+      placePop(pageRect(doc, range.getBoundingClientRect()));
+    }
+
+    // ----- taps, keys, selection inside the section iframes -----
+    function tap(x) {
+      const f = x / window.innerWidth;
+      if (cfg.flow === 'scrolled' || (f > 1 / 3 && f < 2 / 3)) return toggleBars();
+      hideBars();
+      return f < 0.5 ? view.goLeft() : view.goRight();
+    }
+
+    function onKey(ev) {
+      if (ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      const t = ev.target;
+      if (t && t.closest && t.closest('input, textarea, select, [contenteditable]')) return;
+      const k = ev.key;
+      if (k === 'Escape') {
+        if (!fnBox.hidden) closeFootnote();
+        else if (panel) closePanel();
+        else if (!pop.hidden) hidePop();
+        else toggleBars();
+        return;
+      }
+      if (k === 'Tab') return showBars();
+      if (panel || !fnBox.hidden) return;
+      if ((k === ' ' || k === 'Enter') && t && t.closest && t.closest('button, a, summary')) return;
+      let act = null;
+      if (k === 'ArrowLeft') act = () => view.goLeft();
+      else if (k === 'ArrowRight') act = () => view.goRight();
+      else if (k === 'PageUp' || (k === ' ' && ev.shiftKey)) act = () => view.prev();
+      else if (k === 'PageDown' || k === ' ') act = () => view.next();
+      if (!act) return;
+      ev.preventDefault();
+      hideBars();
+      act();
+    }
+    listen(document, 'keydown', onKey);
+
+    view.addEventListener('load', (ev) => {
+      const { doc, index } = ev.detail;
+      const settle = (ms) => { clearTimeout(selTimer); selTimer = setTimeout(() => bookSelectionSettled(doc, index), ms); };
+      doc.addEventListener('selectionchange', () => settle(touchUi.matches ? 300 : 200));
+      doc.addEventListener('pointerdown', (e) => { if (e.pointerType === 'mouse') mouseDown = true; });
+      doc.addEventListener('pointerup', (e) => { if (e.pointerType === 'mouse' && mouseDown) { mouseDown = false; settle(0); } });
+      doc.addEventListener('pointercancel', () => { mouseDown = false; });
+      doc.addEventListener('keydown', onKey);
+      doc.addEventListener('click', (e) => {
+        const s = doc.getSelection();
+        if ((s && !s.isCollapsed) || e.defaultPrevented) return; // finishing a selection, or a link foliate handled
+        const fr = doc.defaultView.frameElement;
+        const x = (fr ? fr.getBoundingClientRect().left : 0) + e.clientX;
+        setTimeout(() => { // after the overlayer had its chance to report a tap on a highlight
+          if (Date.now() - annotationAt < 100) return;
+          if (!pop.hidden) return hidePop();
+          tap(x);
+        }, 0);
+      });
+    });
+    // Clicks in the page margins around the section land on the view itself.
+    view.addEventListener('click', (e) => { if (e.target === view) tap(e.clientX); });
+
+    // ----- footnotes -----
+    const footnotes = new FootnoteHandler();
+    let fnView = null;
+    function closeFootnote() {
+      fnBox.hidden = true;
+      scrim.hidden = !panel;
+      if (fnView) { try { fnView.close(); } catch (_) { /* already gone */ } fnView.remove(); fnView = null; }
+      fnBox.replaceChildren();
+    }
+    footnotes.addEventListener('before-render', (ev) => {
+      closeFootnote();
+      const v = ev.detail.view;
+      fnView = v;
+      fnBox.classList.add('loading');
+      fnBox.hidden = false;
+      fnBox.replaceChildren(v, h('button', { type: 'button', class: 'secondary fn-close', onclick: () => closeFootnote() }, 'Close'));
+      const r = v.renderer;
+      r.setAttribute('flow', 'scrolled');
+      r.setAttribute('margin', '0px');
+      r.setAttribute('gap', '4%');
+      r.setStyles && r.setStyles(readerCSS(cfg, theme()).replace(/aside\[epub[^}]*}/, ''));
+      v.addEventListener('link', (e) => { // a link inside a note: leave the note and follow it in the book
+        e.preventDefault();
+        closeFootnote();
+        view.goTo(e.detail.href);
+      });
+    });
+    footnotes.addEventListener('render', () => { fnBox.classList.remove('loading'); scrim.hidden = false; });
+    scrim.addEventListener('click', () => closeFootnote());
+    view.addEventListener('link', (ev) => {
+      const p = footnotes.handle(view.book, ev);
+      if (p) p.catch((e) => { console.error(e); closeFootnote(); view.goTo(ev.detail.href); });
+    });
+    view.addEventListener('external-link', (ev) => {
+      ev.preventDefault();
+      const url = webUrl(ev.detail.a.href);
+      if (!url) return;
+      if (IN_APP) invoke('plugin:opener|open_url', { url }).catch((e) => toast('Could not open the link: ' + e, { error: true }));
+      else window.open(url, '_blank', 'noopener,noreferrer');
+    });
+
+    // ----- view events -----
+    view.addEventListener('relocate', (ev) => {
+      const loc = ev.detail;
+      cur = { cfi: loc.cfi, fraction: loc.fraction };
+      const pct = Math.round(loc.fraction * 100);
+      percentEl.textContent = pct + '%';
+      chapterEl.textContent = loc.tocItem && loc.tocItem.label ? loc.tocItem.label.trim() : '';
+      slider.setAttribute('aria-valuetext', pct + '%' + (chapterEl.textContent ? ', ' + chapterEl.textContent : ''));
+      if (!dragging) slider.value = loc.fraction;
+      currentHref = loc.tocItem ? loc.tocItem.href : null;
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(pushProgress, SAVE_MS);
+    });
+    view.addEventListener('create-overlay', (ev) => { // a section was (re)loaded: draw its saved highlights
+      for (const hl of hls) if (hlIndex.get(hl) === ev.detail.index) view.addAnnotation({ value: hl.anchor });
+    });
+    view.addEventListener('draw-annotation', (ev) => ev.detail.draw(Overlayer.highlight, { color: HIGHLIGHT_COLOR }));
+    view.addEventListener('show-annotation', (ev) => {
+      const hl = hlByAnchor(ev.detail.value);
+      if (!hl) return;
+      annotationAt = Date.now();
+      showNote(hl, ev.detail.range);
+    });
+
+    let dragging = false;
+    slider.addEventListener('input', () => { dragging = true; percentEl.textContent = Math.round(slider.value * 100) + '%'; showBars(); });
+    slider.addEventListener('change', async () => {
+      await view.goToFraction(parseFloat(slider.value)).catch((e) => console.error(e));
+      dragging = false;
+    });
+    let backTimer = 0;
+    view.history.addEventListener('index-change', () => {
+      clearTimeout(backTimer);
+      backBtn.hidden = !view.history.canGoBack;
+      if (!backBtn.hidden) backTimer = setTimeout(() => { backBtn.hidden = true; }, 8000);
+    });
+
+    // ----- open -----
+    book = {
+      id, view, saveSelection,
+      destroy() {
+        flush();
+        clearTimeout(barsTimer); clearTimeout(backTimer); clearTimeout(saveTimer); clearTimeout(selTimer);
+        closeFootnote();
+        for (const fn of cleanups) fn();
+        try { view.close(); } catch (_) { /* never opened */ }
+        root.remove();
+      },
+    };
+    try {
+      const file = new File([blob], article.title.replace(/[\\/:*?"<>|]+/g, ' ') + '.epub', { type: 'application/epub+zip' });
+      await view.open(file);
+      if (my !== nav) return;
+      view.book.transformTarget?.addEventListener('load', (e) => { if (e.detail.isScript) e.detail.allow = false; }); // no EPUB scripts
+      applySettings();
+      hls.forEach(indexHighlight); // needs the opened book to resolve CFIs
+      for (const f of view.getSectionFractions()) ticks.append(h('option', { value: f }));
+      slider.dir = view.book.dir === 'rtl' ? 'rtl' : 'ltr';
+      title.textContent = article.title;
+      await view.init({ lastLocation: progress && progress.position ? progress.position : null, showTextStart: false });
+      if (view.renderer.focusView) view.renderer.focusView();
+    } catch (e) {
+      if (my !== nav) return;
+      console.error(e);
+      closeBook();
+      show(h('p', null, h('a', { href: '#/' }, '← Library')), h('h1', null, article.title), errorNode(new Error('Could not open this book: ' + (e.message || e))));
+    }
+  }
 
   // ---------- syntheses ----------
 
@@ -680,6 +1335,7 @@
   async function route() {
     const my = ++nav;
     reader = null;
+    closeBook();
     hidePop();
     if (!isConfigured()) return showLogin();
     $nav.hidden = false;
