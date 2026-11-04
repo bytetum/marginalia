@@ -370,3 +370,9 @@ cp deploy/marginalia-kb-sync.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now marginalia-kb-sync.timer
 journalctl --user -u marginalia-kb-sync -n 5   # "+N articles, +N highlights"
 ```
+
+## License
+
+Marginalia is free software under the GNU Affero General Public License, version 3 or later (`LICENSE`). Bundled
+third-party files keep their own licenses, listed next to them: foliate-js (MIT) and zip.js (BSD-3-Clause) in
+`web/vendor/foliate-js/`, Literata (SIL OFL 1.1) in `web/vendor/fonts/literata/`.
