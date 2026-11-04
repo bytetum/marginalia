@@ -474,6 +474,45 @@ async fn save_link_accepts_a_trusted_login_instead_of_the_token() {
 }
 
 #[tokio::test]
+async fn save_link_from_another_site_asks_before_saving_with_the_login_alone() {
+    // An <img src=/save?url=...> on any page the owner opens would otherwise save that URL and make the server fetch
+    // it. The login is ambient; the browser's Sec-Fetch-Site label tells the two apart. No network is needed: the
+    // refused requests never fetch, and the allowed ones lack a url.
+    let (app, _dir) = app();
+    let router = api::router(app, tailscale_auth());
+    for site in ["cross-site", "same-site"] {
+        let (status, headers, body) = raw(
+            &router,
+            "GET",
+            "/save?url=https%3A%2F%2Fevil.example%2F%22%3E%3Cscript%3E",
+            &[(LOGIN, "owner@github"), ("sec-fetch-site", site)],
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{site}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("Save this page?") && page.contains("action=\"/save\""), "{page}");
+        assert!(page.contains("https://evil.example/&quot;&gt;&lt;script&gt;") && !page.contains("<script>"), "{page}");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    }
+    let (_, body) = call(&router, "GET", "/articles", Some(TOKEN), None).await;
+    assert_eq!(body.as_array().map(Vec::len), Some(0), "nothing was saved");
+
+    // The confirm form's own submit (same-origin), a typed URL or share sheet (none), and non-browser clients (no
+    // header) get past auth: the missing url is what they hit.
+    for site in [Some("same-origin"), Some("none"), None] {
+        let mut h = vec![(LOGIN, "owner@github")];
+        if let Some(site) = site {
+            h.push(("sec-fetch-site", site));
+        }
+        assert_eq!(call_with(&router, "GET", "/save", &h).await.0, StatusCode::BAD_REQUEST, "{site:?}");
+    }
+    // The token still works from anywhere: a bookmarklet runs on the other site's page.
+    let h = [("sec-fetch-site", "cross-site")];
+    assert_eq!(call_with(&router, "GET", "/save?token=s3cret", &h).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn me_reports_how_the_caller_got_in() {
     let (app, _dir) = app();
     let router = api::router(app, tailscale_auth());

@@ -590,16 +590,29 @@ struct SaveLink {
 /// takes the token in the query string. With a token configured it is required unless the request carries a trusted
 /// `Tailscale-User-Login` (a device signed in as the owner needs no token), and the response never echoes it.
 /// Failures are small HTML pages because the browser is navigating here.
+///
+/// The login is an ambient credential and this GET changes state, so a page on another site could otherwise save
+/// (and make the server fetch) any URL through the owner's browser, with an `<img src=/save?url=...>` for example.
+/// A cross-site request let in by the login alone therefore saves nothing: it gets a page with a Save button whose
+/// same-origin submit is let through. The token, and requests the owner starts (typed, a bookmark, a share sheet,
+/// the app's own pages), still save at once.
 async fn save_link(State(state): State<SaveState>, headers: HeaderMap, Params(q): Params<SaveLink>) -> Response {
+    let url = q.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
     if let Some(expected) = &state.auth.token {
         let presented = q.token.as_deref().unwrap_or("");
-        if !constant_time_eq(presented.as_bytes(), expected.as_bytes())
-            && tailscale_login(&state.auth, &headers).is_none()
-        {
-            return save_page(StatusCode::UNAUTHORIZED, "Missing or invalid token.");
+        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            if tailscale_login(&state.auth, &headers).is_none() {
+                return save_page(StatusCode::UNAUTHORIZED, "Missing or invalid token.");
+            }
+            if is_cross_site(&headers) {
+                return match url {
+                    Some(url) => confirm_save_page(url),
+                    None => save_page(StatusCode::BAD_REQUEST, "Missing url parameter."),
+                };
+            }
         }
     }
-    let Some(url) = q.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+    let Some(url) = url else {
         return save_page(StatusCode::BAD_REQUEST, "Missing url parameter.");
     };
     match state.app.save_url(url).await {
@@ -619,6 +632,23 @@ fn no_store(res: &mut Response) {
     let headers = res.headers_mut();
     headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     headers.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+}
+
+/// Asks before saving a URL that another site sent here (see `save_link`). The form submits from this origin, so the
+/// browser labels that request same-origin and it saves.
+fn confirm_save_page(url: &str) -> Response {
+    let url = escape_html(url);
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Save to Marginalia?</title><style>body{{font:16px system-ui,sans-serif;max-width:32rem;margin:2rem auto;\
+         padding:0 1rem}}p.u{{overflow-wrap:anywhere;color:#555}}button{{font:inherit;padding:.6rem 1.2rem}}</style>\
+         <h1>Save this page?</h1><p>Another site asked Marginalia to save:</p><p class=\"u\">{url}</p>\
+         <form method=\"get\" action=\"/save\"><input type=\"hidden\" name=\"url\" value=\"{url}\">\
+         <button type=\"submit\">Save</button></form><p><a href=\"/\">Open the library</a></p>"
+    );
+    let mut res = (StatusCode::OK, Html(body)).into_response();
+    no_store(&mut res);
+    res
 }
 
 fn save_page(status: StatusCode, message: &str) -> Response {
