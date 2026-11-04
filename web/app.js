@@ -631,7 +631,7 @@
   // page is hidden). A highlight's anchor is the CFI of the selected range (view.getCFI), drawn with view.addAnnotation.
 
   const READER_KEY = 'marginalia.reader'; // reading settings, per device
-  const DEFAULT_SETTINGS = { v: 2, flow: 'paginated', theme: 'auto', font: 'book', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'justify', hyphenate: true, turn: 'paper' };
+  const DEFAULT_SETTINGS = { v: 2, flow: 'paginated', theme: 'auto', font: 'book', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'justify', hyphenate: true, turn: 'paper', bright: 1 };
   const THEMES = { // book page colours; the app chrome follows through #book[data-theme] in app.css
     light: { bg: '#fbfaf7', fg: '#1d1d1b', link: '#1a5fb4' },
     dark: { bg: '#17171a', fg: '#e6e4dc', link: '#7db2f5' },
@@ -654,6 +654,50 @@
 
   let book = null; // {id, view, saveSelection, destroy} while a book is open
 
+  // Reader toolbar icons: 24x24 stroke drawings (our own), coloured by currentColor.
+  const ICONS = {
+    search: '<circle cx="11" cy="11" r="7"/><path d="M16.5 16.5 21 21"/>',
+    notes: '<path d="M15 4l5 5L9 20H4v-5z"/><path d="M13 6l5 5"/>',
+    close: '<path d="M6 6l12 12M18 6 6 18"/>',
+    toc: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r=".6"/><circle cx="4.5" cy="12" r=".6"/><circle cx="4.5" cy="18" r=".6"/>',
+    theme: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    progress: '<path d="M2 12h7M15 12h7"/><circle cx="12" cy="12" r="3"/>',
+    font: '<path d="M5 20 12 4l7 16M8 14h8"/>',
+    prevChapter: '<path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/>',
+    nextChapter: '<path d="M13 17l5-5-5-5M6 17l5-5-5-5"/>',
+  };
+  function icon(name) {
+    const span = document.createElement('span');
+    span.className = 'icon';
+    span.setAttribute('aria-hidden', 'true');
+    span.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + ICONS[name] + '</svg>';
+    return span;
+  }
+
+  // Highlights with rounded corners, merged per line (foliate's Overlayer.highlight draws square rects per text box).
+  function roundedHighlight(rects, { color }) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const g = document.createElementNS(NS, 'g');
+    g.setAttribute('fill', color);
+    g.style.opacity = 'var(--overlayer-highlight-opacity, .3)';
+    const lines = [];
+    for (const r of rects) {
+      const line = lines.find((l) => Math.abs(l.top - r.top) < 2 && Math.abs(l.height - r.height) < 2 && r.left <= l.right + 2 && r.left + r.width >= l.left - 2);
+      if (line) { line.left = Math.min(line.left, r.left); line.right = Math.max(line.right, r.left + r.width); }
+      else lines.push({ left: r.left, right: r.left + r.width, top: r.top, height: r.height });
+    }
+    for (const l of lines) {
+      const el = document.createElementNS(NS, 'rect');
+      el.setAttribute('x', l.left - 2);
+      el.setAttribute('y', l.top);
+      el.setAttribute('width', l.right - l.left + 4);
+      el.setAttribute('height', l.height);
+      el.setAttribute('rx', 4);
+      g.append(el);
+    }
+    return g;
+  }
+
   function loadSettings() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(READER_KEY)) || {}; } catch (_) { /* keep the defaults */ }
@@ -667,6 +711,7 @@
     if (!MARGINS[s.margin]) s.margin = DEFAULT_SETTINGS.margin;
     if (s.columns !== 1) s.columns = 2;
     if (!['paper', 'slide', 'none'].includes(s.turn)) s.turn = DEFAULT_SETTINGS.turn;
+    s.bright = Math.min(1, Math.max(0.3, +s.bright || 1));
     if (!FONTS[s.font] && s.font !== 'publisher') s.font = DEFAULT_SETTINGS.font;
     return s;
   }
@@ -792,22 +837,27 @@
     const listen = (target, type, fn, opts) => { target.addEventListener(type, fn, opts); cleanups.push(() => target.removeEventListener(type, fn, opts)); };
 
     // ----- chrome -----
-    const iconBtn = (label, text, onclick) => h('button', { type: 'button', class: 'tb', 'aria-label': label, title: label, onclick }, text);
+    // Toolbars in the manner of a dedicated reader: icons only, on the page colour. Top: search and notes, close.
+    // Bottom: contents, theme and brightness, position, font and layout; each opens a sheet.
+    const iconBtn = (label, name, onclick) => h('button', { type: 'button', class: 'tb', 'aria-label': label, title: label, onclick }, icon(name));
     const title = h('span', { class: 'book-title' }, article.title);
-    const hlBtn = iconBtn('Highlights and notes', 'Notes', () => openPanel('highlights', hlBtn));
+    const hlBtn = iconBtn('Highlights and notes', 'notes', () => openPanel('highlights', hlBtn));
     const top = h('div', { class: 'book-top' },
-      h('a', { class: 'tb', href: '#/', 'aria-label': 'Back to the library', title: 'Library' }, '‹'), title,
-      iconBtn('Table of contents', '☰', function () { openPanel('toc', this); }),
-      iconBtn('Search in the book', 'Find', function () { openPanel('search', this); }),
+      iconBtn('Search in the book', 'search', function () { openPanel('search', this); }),
       hlBtn,
-      iconBtn('Reading settings', 'Aa', function () { openPanel('settings', this); }));
+      title,
+      h('a', { class: 'tb', href: '#/', 'aria-label': 'Close the book', title: 'Close' }, icon('close')));
     const chapterEl = h('span', { class: 'book-chapter' });
     const percentEl = h('span', { class: 'book-percent' });
+    const pageEl = h('span', { class: 'book-page' });
     const slider = h('input', { type: 'range', min: 0, max: 1, step: 'any', value: 0, class: 'book-slider', 'aria-label': 'Position in the book', list: 'book-ticks' });
     const ticks = h('datalist', { id: 'book-ticks' });
     const bottom = h('div', { class: 'book-bottom' },
-      h('div', { class: 'book-where' }, chapterEl, percentEl),
-      h('div', { class: 'book-seek' }, iconBtn('Previous page', '‹', () => turnPage('left')), slider, ticks, iconBtn('Next page', '›', () => turnPage('right'))));
+      iconBtn('Table of contents', 'toc', function () { openPanel('toc', this); }),
+      iconBtn('Theme and brightness', 'theme', function () { openPanel('theme', this); }),
+      iconBtn('Position in the book', 'progress', function () { openPanel('progress', this); }),
+      iconBtn('Font and layout', 'font', function () { openPanel('settings', this); }));
+    const dim = h('div', { class: 'book-dim', 'aria-hidden': 'true' });
     const backBtn = h('button', { type: 'button', class: 'book-back', hidden: true, onclick: () => view.history.back() }, '← Back');
     // The paper turn's sheet: a copy of the page on screen, laid over the view while it folds away (see turnPage).
     const leafShade = h('div', { class: 'leaf-shade' });
@@ -817,7 +867,7 @@
     const sheet = h('div', { class: 'book-sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
     const scrim = h('div', { class: 'book-scrim', hidden: true, onclick: () => closePanel() });
     const fnBox = h('div', { class: 'book-fn', role: 'dialog', 'aria-label': 'Note', hidden: true });
-    const root = h('div', { id: 'book', class: 'book bars' }, stage, top, bottom, backBtn, scrim, sheet, fnBox);
+    const root = h('div', { id: 'book', class: 'book bars' }, stage, dim, top, bottom, backBtn, scrim, sheet, fnBox);
     document.body.append(root);
     document.body.classList.add('reading');
 
@@ -845,6 +895,7 @@
     const theme = () => (cfg.theme === 'auto' ? (dark.matches ? 'dark' : 'light') : cfg.theme);
     function applySettings() {
       root.dataset.theme = theme();
+      dim.style.opacity = String(1 - cfg.bright);
       const r = view.renderer;
       if (!r) return;
       const m = MARGINS[cfg.margin];
@@ -862,6 +913,7 @@
     dark.addEventListener('change', onScheme);
     cleanups.push(() => dark.removeEventListener('change', onScheme));
     root.dataset.theme = theme();
+    dim.style.opacity = String(1 - cfg.bright);
 
     // ----- progress sync -----
     let cur = null; // {cfi, fraction} of the page on screen
@@ -896,11 +948,12 @@
       opener = from || opener;
       panel = name;
       clearTimeout(barsTimer);
-      const builders = { toc: tocPanel, search: searchPanel, highlights: highlightsPanel, settings: settingsPanel };
+      const builders = { toc: tocPanel, search: searchPanel, highlights: highlightsPanel, settings: settingsPanel, theme: themePanel, progress: progressPanel };
       const [heading, content] = builders[name]();
-      const close = h('button', { type: 'button', class: 'secondary', onclick: () => closePanel() }, 'Close');
+      const close = h('button', { type: 'button', class: 'tb sheet-close', 'aria-label': 'Close', title: 'Close', onclick: () => closePanel() }, icon('close'));
       sheet.setAttribute('aria-label', heading);
       sheet.replaceChildren(h('div', { class: 'sheet-head' }, h('h2', null, heading), close), h('div', { class: 'sheet-body' }, content));
+      sheet.dataset.panel = name;
       sheet.hidden = scrim.hidden = false;
       const first = sheet.querySelector('input[type=search], .toc-cur, .sheet-body button, .sheet-body input') || close;
       first.focus({ preventScroll: true });
@@ -991,35 +1044,64 @@
     }
 
     // Settings
+    // Controls shared by the settings sheets: each change is saved and applied at once.
+    const set = (key, value) => { cfg[key] = value; saveSettings(); applySettings(); };
+    const seg = (label, key, options) => {
+      const btns = options.map(([text, value]) => h('button', { type: 'button', class: 'secondary', 'aria-pressed': String(cfg[key] === value), onclick: () => {
+        set(key, value);
+        btns.forEach((b, i) => b.setAttribute('aria-pressed', String(options[i][1] === value)));
+      } }, text));
+      return h('div', { class: 'set-row', role: 'group', 'aria-label': label }, h('span', { class: 'set-label' }, label), h('div', { class: 'seg' }, btns));
+    };
+    const range = (label, key, min, max, step, fmt) => {
+      const out = h('output', null, fmt(cfg[key]));
+      const input = h('input', { type: 'range', min, max, step, value: cfg[key], 'aria-label': label, oninput: () => {
+        out.textContent = fmt(+input.value);
+        set(key, +input.value);
+      } });
+      return h('div', { class: 'set-row' }, h('span', { class: 'set-label' }, label), h('div', { class: 'slide' }, input, out));
+    };
     function settingsPanel() {
-      const set = (key, value) => { cfg[key] = value; saveSettings(); applySettings(); };
-      const seg = (label, key, options) => {
-        const btns = options.map(([text, value]) => h('button', { type: 'button', class: 'secondary', 'aria-pressed': String(cfg[key] === value), onclick: () => {
-          set(key, value);
-          btns.forEach((b, i) => b.setAttribute('aria-pressed', String(options[i][1] === value)));
-        } }, text));
-        return h('div', { class: 'set-row', role: 'group', 'aria-label': label }, h('span', { class: 'set-label' }, label), h('div', { class: 'seg' }, btns));
-      };
-      const range = (label, key, min, max, step, fmt) => {
-        const out = h('output', null, fmt(cfg[key]));
-        const input = h('input', { type: 'range', min, max, step, value: cfg[key], 'aria-label': label, oninput: () => {
-          out.textContent = fmt(+input.value);
-          set(key, +input.value);
-        } });
-        return h('div', { class: 'set-row' }, h('span', { class: 'set-label' }, label), h('div', { class: 'slide' }, input, out));
-      };
       const hyph = h('input', { type: 'checkbox', checked: cfg.hyphenate, id: 'set-hyph', onchange: () => set('hyphenate', hyph.checked) });
-      return ['Reading settings', [
-        seg('Layout', 'flow', [['Paginated', 'paginated'], ['Scrolled', 'scrolled']]),
-        seg('Page turn', 'turn', [['Paper', 'paper'], ['Slide', 'slide'], ['None', 'none']]),
-        seg('Theme', 'theme', [['Auto', 'auto'], ['Light', 'light'], ['Dark', 'dark'], ['Sepia', 'sepia']]),
+      const step = (d) => { const v = Math.min(34, Math.max(12, cfg.size + d)); set('size', v); sizeOut.textContent = v + ' px'; };
+      const sizeOut = h('output', null, cfg.size + ' px');
+      return ['Font & layout', [
         seg('Font', 'font', [['Literata', 'book'], ['Publisher', 'publisher'], ['Serif', 'serif'], ['Sans', 'sans']]),
-        range('Font size', 'size', 12, 34, 1, (v) => v + ' px'),
+        h('div', { class: 'set-row' }, h('span', { class: 'set-label' }, 'Font size'), h('div', { class: 'stepper' },
+          h('button', { type: 'button', class: 'secondary', 'aria-label': 'Smaller text', onclick: () => step(-1) }, h('span', { class: 'a-small' }, 'A')),
+          sizeOut,
+          h('button', { type: 'button', class: 'secondary', 'aria-label': 'Larger text', onclick: () => step(1) }, h('span', { class: 'a-large' }, 'A')))),
         range('Line height', 'line', 1.1, 2.2, 0.05, (v) => v.toFixed(2)),
         seg('Margins', 'margin', [['Narrow', 'narrow'], ['Medium', 'medium'], ['Wide', 'wide']]),
         seg('Columns (wide screens)', 'columns', [['1', 1], ['2', 2]]),
         seg('Alignment', 'align', [['Publisher', 'publisher'], ['Left', 'start'], ['Justified', 'justify']]),
         h('div', { class: 'set-row' }, h('label', { for: 'set-hyph', class: 'set-label' }, 'Hyphenation'), hyph),
+        seg('Layout', 'flow', [['Paginated', 'paginated'], ['Scrolled', 'scrolled']]),
+        seg('Page turn', 'turn', [['Paper', 'paper'], ['Slide', 'slide'], ['None', 'none']]),
+      ]];
+    }
+
+    function themePanel() {
+      const names = [['auto', 'Auto'], ['light', 'Light'], ['sepia', 'Sepia'], ['dark', 'Dark']];
+      const btns = names.map(([value, text]) => h('button', { type: 'button', class: 'swatch', 'data-swatch': value, 'aria-pressed': String(cfg.theme === value), onclick: () => {
+        set('theme', value);
+        btns.forEach((b, i) => b.setAttribute('aria-pressed', String(names[i][0] === value)));
+      } }, h('span', { class: 'swatch-face' }, 'Aa'), h('span', null, text)));
+      return ['Theme', [
+        h('div', { class: 'swatches', role: 'group', 'aria-label': 'Theme' }, btns),
+        range('Brightness', 'bright', 0.3, 1, 0.05, (v) => Math.round(v * 100) + '%'),
+      ]];
+    }
+
+    // Position: the slider (kept across openings, updated on every page), chapter, page and chapter jumps
+    function progressPanel() {
+      return ['Position', [
+        h('div', { class: 'book-where' }, chapterEl, percentEl),
+        h('div', { class: 'book-seek' },
+          h('button', { type: 'button', class: 'tb', 'aria-label': 'Previous chapter', title: 'Previous chapter', onclick: () => view.renderer.prevSection && view.renderer.prevSection() }, icon('prevChapter')),
+          slider, ticks,
+          h('button', { type: 'button', class: 'tb', 'aria-label': 'Next chapter', title: 'Next chapter', onclick: () => view.renderer.nextSection && view.renderer.nextSection() }, icon('nextChapter'))),
+        h('p', { class: 'muted book-pages' }, pageEl),
       ]];
     }
 
@@ -1314,6 +1396,7 @@
       cur = { cfi: loc.cfi, fraction: loc.fraction };
       const pct = Math.round(loc.fraction * 100);
       percentEl.textContent = pct + '%';
+      pageEl.textContent = loc.location && loc.location.total ? 'Page ' + (loc.location.current + 1) + ' of ' + loc.location.total : '';
       chapterEl.textContent = loc.tocItem && loc.tocItem.label ? loc.tocItem.label.trim() : '';
       slider.setAttribute('aria-valuetext', pct + '%' + (chapterEl.textContent ? ', ' + chapterEl.textContent : ''));
       if (!dragging) slider.value = loc.fraction;
@@ -1324,7 +1407,7 @@
     view.addEventListener('create-overlay', (ev) => { // a section was (re)loaded: draw its saved highlights
       for (const hl of hls) if (hlIndex.get(hl) === ev.detail.index) view.addAnnotation({ value: hl.anchor });
     });
-    view.addEventListener('draw-annotation', (ev) => ev.detail.draw(Overlayer.highlight, { color: HIGHLIGHT_COLOR }));
+    view.addEventListener('draw-annotation', (ev) => ev.detail.draw(roundedHighlight, { color: HIGHLIGHT_COLOR }));
     view.addEventListener('show-annotation', (ev) => {
       const hl = hlByAnchor(ev.detail.value);
       if (!hl) return;

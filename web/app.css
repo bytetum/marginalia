@@ -1,3 +1,4 @@
+@font-face { font-family: "Literata"; src: url("vendor/fonts/literata/Literata.woff2") format("woff2"); font-weight: 200 900; font-style: normal; font-display: swap; }
 :root {
   --bg: #fbfaf7;
   --fg: #1d1d1b;
@@ -245,16 +246,21 @@ body.reading > header, body.reading > main { display: none; }
   align-items: center;
   padding-left: max(.5rem, env(safe-area-inset-left));
   padding-right: max(.5rem, env(safe-area-inset-right));
-  background: var(--card);
+  background: var(--bg);
   border: 0 solid var(--line);
   transition: transform .2s ease, opacity .2s ease, visibility .2s;
 }
 .book-top { top: 0; padding-top: env(safe-area-inset-top); min-height: calc(var(--tb) + env(safe-area-inset-top)); border-bottom-width: 1px; }
-.book-bottom { bottom: 0; flex-direction: column; align-items: stretch; gap: 0; padding-top: .35rem; padding-bottom: max(.35rem, env(safe-area-inset-bottom)); border-top-width: 1px; }
+.book-top { border-bottom-width: 0; }
+.book-bottom { bottom: 0; justify-content: space-around; padding-top: .35rem; padding-bottom: max(.35rem, env(safe-area-inset-bottom)); background: var(--card); }
 #book:not(.bars) .book-top { transform: translateY(-100%); opacity: 0; visibility: hidden; }
 #book:not(.bars) .book-bottom { transform: translateY(100%); opacity: 0; visibility: hidden; }
 
-.book-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.book-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; font-size: .85rem; color: var(--muted); }
+.icon { display: inline-flex; }
+.icon svg { display: block; }
+/* Brightness: a black veil over the page, under the toolbars (Theme sheet). */
+.book-dim { position: absolute; inset: 0; z-index: 1; background: #000; opacity: 0; pointer-events: none; }
 button.tb, a.tb {
   display: inline-flex;
   align-items: center;
@@ -264,9 +270,10 @@ button.tb, a.tb {
   padding: 0 .5rem;
   font: inherit;
   font-weight: 600;
-  color: var(--accent);
+  color: var(--fg);
   background: none;
   border: 0;
+  border-radius: 10px;
   text-decoration: none;
   cursor: pointer;
 }
@@ -287,7 +294,28 @@ a.tb { font-size: 1.6rem; }
   box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
   transition: bottom .2s ease;
 }
-#book.bars .book-back { bottom: calc(6.25rem + env(safe-area-inset-bottom)); }
+#book.bars .book-back { bottom: calc(4.5rem + env(safe-area-inset-bottom)); }
+button.tb:active, a.tb:active { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+
+.sheet-close { margin-right: -.5rem; }
+.book-page, .book-pages { font-variant-numeric: tabular-nums; }
+.book-pages { margin: .25rem 0 0; text-align: center; font-size: .85rem; }
+.book-sheet[data-panel="progress"] .book-where { padding: .5rem 0 0; }
+
+.swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: .5rem; margin: .5rem 0 1rem; }
+button.swatch { display: flex; flex-direction: column; align-items: center; gap: .35rem; padding: .25rem 0; font: inherit; font-size: .85rem; color: var(--fg); background: none; border: 0; cursor: pointer; }
+.swatch-face { display: grid; place-items: center; width: 3.25rem; height: 3.25rem; border-radius: 50%; border: 2px solid var(--line); font-family: "Literata", Georgia, serif; font-size: 1.15rem; }
+button.swatch[aria-pressed="true"] .swatch-face { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+[data-swatch="light"] .swatch-face { background: #fbfaf7; color: #1d1d1b; }
+[data-swatch="sepia"] .swatch-face { background: #f4ecd8; color: #5b4636; }
+[data-swatch="dark"] .swatch-face { background: #17171a; color: #e6e4dc; }
+[data-swatch="auto"] .swatch-face { background: linear-gradient(135deg, #fbfaf7 50%, #17171a 50%); color: #888; }
+
+.stepper { display: flex; align-items: center; gap: .75rem; }
+.stepper output { min-width: 3.5rem; text-align: center; font-variant-numeric: tabular-nums; }
+.stepper button { min-width: 44px; min-height: 40px; }
+.a-small { font-size: .8rem; }
+.a-large { font-size: 1.3rem; }
 
 .book-scrim { position: absolute; z-index: 3; inset: 0; background: rgba(0, 0, 0, .35); }
 
