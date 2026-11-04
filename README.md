@@ -215,8 +215,11 @@ personal Tailscale-only service; rotate `MARGINALIA_TOKEN` if a device is lost.
   2. Show Result (or Show Notification).
 
   Saving fetches and cleans the page, so allow a few seconds. The shortcut keeps the token inside the shortcut.
-  On devices signed in to Tailscale as the owner (with `--tailscale-login`), the bookmarklet can drop `&token=TOKEN`
-  and the shortcuts can drop the `Authorization` header.
+  On devices signed in to Tailscale as the owner (with `--tailscale-login`), the shortcuts can drop the `Authorization`
+  header, and the bookmarklet can drop `&token=TOKEN` at the cost of one tap: a bookmarklet runs on the page you are
+  reading, so its request is cross-site, and a cross-site `/save` let in by the login alone only shows a **Save**
+  button (otherwise any page you open could save URLs through your browser). Keep the token in the bookmarklet to save
+  at once.
 - **Android.** Install the HTTP Shortcuts app: create a shortcut with POST `https://marginalia-bytetum.taild98079.ts.net/articles`,
   JSON body `{"url": "<shared text>"}` (insert the app's shared-text variable), header `Authorization: Bearer TOKEN`, and enable it as a
   share target. Or use the bookmarklet above in a browser that allows `javascript:` bookmarks (Firefox does; Chrome
