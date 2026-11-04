@@ -527,10 +527,11 @@ fn content_type(path: &str) -> &'static str {
 /// Headers for the static files. The CSP keeps `script-src 'self'` (no `blob:`, no inline), so script inside an
 /// EPUB cannot run even though the reader renders each book section in a `blob:` iframe, which inherits this policy;
 /// styles, images and fonts are opened up because books carry their own. Images may come from anywhere because
-/// articles link them.
+/// articles link them. `frame-ancestors` is `'self'`, not `'none'`: WebKit enforces the inherited policy on those
+/// `blob:` sections too, so `'none'` stops Safari from showing any page of a book.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; \
                    img-src 'self' data: blob: http: https:; font-src 'self' data: blob:; frame-src 'self' blob:; \
-                   connect-src 'self' blob:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+                   connect-src 'self' blob:; base-uri 'none'; form-action 'self'; frame-ancestors 'self'";
 
 fn static_file(content_type: &'static str, body: &'static [u8]) -> Response {
     (

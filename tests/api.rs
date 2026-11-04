@@ -718,6 +718,8 @@ async fn embedded_web_files_are_public_and_everything_else_still_needs_the_token
     assert!(String::from_utf8_lossy(&body).contains("foliate-js"));
     let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().expect("csp");
     assert!(csp.contains("script-src 'self';") && csp.contains("frame-src 'self' blob:"), "{csp}");
+    // Safari applies the inherited policy to the reader's blob: section frames, so 'none' would blank every book.
+    assert!(csp.contains("frame-ancestors 'self'") && !csp.contains("frame-ancestors 'none'"), "{csp}");
     assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 
     // Not in the embedded table (or hidden, or a directory, or a traversal): not public, so 401 without the token.
