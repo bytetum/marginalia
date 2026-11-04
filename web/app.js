@@ -631,7 +631,7 @@
   // page is hidden). A highlight's anchor is the CFI of the selected range (view.getCFI), drawn with view.addAnnotation.
 
   const READER_KEY = 'marginalia.reader'; // reading settings, per device
-  const DEFAULT_SETTINGS = { flow: 'paginated', theme: 'auto', font: 'publisher', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'publisher', hyphenate: true };
+  const DEFAULT_SETTINGS = { flow: 'paginated', theme: 'auto', font: 'publisher', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'publisher', hyphenate: true, turn: 'paper' };
   const THEMES = { // book page colours; the app chrome follows through #book[data-theme] in app.css
     light: { bg: '#fbfaf7', fg: '#1d1d1b', link: '#1a5fb4' },
     dark: { bg: '#17171a', fg: '#e6e4dc', link: '#7db2f5' },
@@ -644,6 +644,7 @@
   };
   const HIGHLIGHT_COLOR = '#f2b705';
   const BARS_MS = 3500; // how long the toolbars stay after the last interaction
+  const TURN_MS = 420; // paper page turn
   const SAVE_MS = 2000; // progress debounce
   const CACHE_BOOKS = 6; // EPUBs kept in IndexedDB
 
@@ -657,6 +658,7 @@
     s.line = Math.min(2.2, Math.max(1.1, +s.line || DEFAULT_SETTINGS.line));
     if (!MARGINS[s.margin]) s.margin = DEFAULT_SETTINGS.margin;
     if (s.columns !== 1) s.columns = 2;
+    if (!['paper', 'slide', 'none'].includes(s.turn)) s.turn = DEFAULT_SETTINGS.turn;
     return s;
   }
 
@@ -794,9 +796,13 @@
     const ticks = h('datalist', { id: 'book-ticks' });
     const bottom = h('div', { class: 'book-bottom' },
       h('div', { class: 'book-where' }, chapterEl, percentEl),
-      h('div', { class: 'book-seek' }, iconBtn('Previous page', '‹', () => view.goLeft()), slider, ticks, iconBtn('Next page', '›', () => view.goRight())));
+      h('div', { class: 'book-seek' }, iconBtn('Previous page', '‹', () => turnPage('left')), slider, ticks, iconBtn('Next page', '›', () => turnPage('right'))));
     const backBtn = h('button', { type: 'button', class: 'book-back', hidden: true, onclick: () => view.history.back() }, '← Back');
-    const stage = h('div', { class: 'book-stage' }, view);
+    // The paper turn's sheet: a copy of the page on screen, laid over the view while it folds away (see turnPage).
+    const leafShade = h('div', { class: 'leaf-shade' });
+    const leafClip = h('div', { class: 'leaf-clip' });
+    const leaf = h('div', { class: 'leaf', 'aria-hidden': 'true' }, leafClip, leafShade);
+    const stage = h('div', { class: 'book-stage' }, view, leaf);
     const sheet = h('div', { class: 'book-sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
     const scrim = h('div', { class: 'book-scrim', hidden: true, onclick: () => closePanel() });
     const fnBox = h('div', { class: 'book-fn', role: 'dialog', 'aria-label': 'Note', hidden: true });
@@ -835,7 +841,10 @@
       r.setAttribute('gap', m.gap);
       r.setAttribute('margin', m.margin);
       r.setAttribute('max-column-count', String(cfg.columns));
+      if (motion() === 'none') r.removeAttribute('animated'); // 'slide', and a swipe in 'paper', animate foliate's scroll
+      else r.setAttribute('animated', '');
       r.setStyles && r.setStyles(readerCSS(cfg, theme()));
+      styleVer++;
     }
     const saveSettings = () => { try { localStorage.setItem(READER_KEY, JSON.stringify(cfg)); } catch (_) { /* private mode */ } };
     const onScheme = () => { if (cfg.theme === 'auto') applySettings(); };
@@ -991,6 +1000,7 @@
       const hyph = h('input', { type: 'checkbox', checked: cfg.hyphenate, id: 'set-hyph', onchange: () => set('hyphenate', hyph.checked) });
       return ['Reading settings', [
         seg('Layout', 'flow', [['Paginated', 'paginated'], ['Scrolled', 'scrolled']]),
+        seg('Page turn', 'turn', [['Paper', 'paper'], ['Slide', 'slide'], ['None', 'none']]),
         seg('Theme', 'theme', [['Auto', 'auto'], ['Light', 'light'], ['Dark', 'dark'], ['Sepia', 'sepia']]),
         seg('Font', 'font', [['Publisher', 'publisher'], ['Serif', 'serif'], ['Sans', 'sans']]),
         range('Font size', 'size', 12, 34, 1, (v) => v + ' px'),
@@ -1054,12 +1064,117 @@
       placePop(pageRect(doc, range.getBoundingClientRect()));
     }
 
+    // ----- page turns -----
+    // 'paper': a copy of the section, positioned exactly like the page on screen, lies over the view; the view moves
+    // underneath without animation (and may load the next section meanwhile); then the copy folds away about the spine
+    // like a sheet of paper. 'slide' is foliate's animated scroll, 'none' jumps. A swipe drags the page in every mode.
+    // The copy is a second iframe kept per section (built after each relocation, rebuilt when the layout changes), so
+    // a turn does not wait for it; while it is not ready a turn is a plain one.
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const motion = () => (reduceMotion.matches ? 'none' : cfg.turn);
+    const onMotion = () => applySettings();
+    reduceMotion.addEventListener('change', onMotion);
+    cleanups.push(() => reduceMotion.removeEventListener('change', onMotion));
+    let styleVer = 0; // bumped by applySettings: the copy must carry the same styles
+    let copy = null; // {doc, key, frame, url, loaded}
+    let turning = null; // {anim, done} while a sheet folds
+    let copyTimer = 0;
+
+    function shown() {
+      const c = view.renderer && view.renderer.getContents ? view.renderer.getContents()[0] : null;
+      const fr = c && c.doc && c.doc.defaultView ? c.doc.defaultView.frameElement : null;
+      return fr && fr.parentElement && fr.parentElement.parentElement ? { doc: c.doc, fr } : null;
+    }
+    const copyKey = (doc, fr) => [fr.offsetWidth, fr.offsetHeight, doc.documentElement.style.cssText, styleVer, theme()].join('|');
+    function dropCopy() {
+      if (!copy) return;
+      copy.frame.remove();
+      URL.revokeObjectURL(copy.url);
+      copy = null;
+    }
+    function ensureCopy() {
+      const s = shown();
+      if (!s || cfg.flow === 'scrolled' || motion() !== 'paper') { if (!turning) dropCopy(); return null; }
+      const key = copyKey(s.doc, s.fr);
+      if (copy && copy.doc === s.doc && copy.key === key) return copy;
+      if (turning) return null; // the sheet is showing the old copy
+      dropCopy();
+      const xml = (s.doc.contentType || '').includes('xml');
+      const text = xml ? new XMLSerializer().serializeToString(s.doc) : '<!DOCTYPE html>' + s.doc.documentElement.outerHTML;
+      const url = URL.createObjectURL(new Blob([text], { type: (xml ? s.doc.contentType : 'text/html') + ';charset=utf-8' }));
+      // no allow-scripts: nothing runs in the copy (book scripts are also refused by the CSP it inherits)
+      const frame = h('iframe', { class: 'leaf-frame', sandbox: 'allow-same-origin', scrolling: 'no', tabindex: '-1', src: url });
+      frame.style.width = s.fr.offsetWidth + 'px';
+      frame.style.height = s.fr.offsetHeight + 'px';
+      const c = { doc: s.doc, key, frame, url, loaded: false };
+      frame.addEventListener('load', () => { c.loaded = true; }, { once: true });
+      copy = c;
+      leafClip.replaceChildren(frame);
+      return c;
+    }
+    const scheduleCopy = () => { clearTimeout(copyTimer); copyTimer = setTimeout(ensureCopy, 300); };
+
+    async function turnPage(dir) {
+      const rtl = view.book && view.book.dir === 'rtl';
+      const forward = dir === 'next' || (dir === 'right' && !rtl) || (dir === 'left' && rtl);
+      const go = () => (forward ? view.next() : view.prev());
+      if (turning) { turning.anim.finish(); await turning.done; }
+      const r = view.renderer;
+      const s = shown();
+      const c = ensureCopy();
+      if (!r || !s || !c || !c.loaded || c.doc !== s.doc || r.scrolled) return go();
+      // Lay the copy over the page on screen: the same clip as foliate's scrolling container, the same offset inside it.
+      const sr = stage.getBoundingClientRect();
+      const cr = s.fr.parentElement.parentElement.getBoundingClientRect();
+      const ir = s.fr.getBoundingClientRect();
+      Object.assign(leafClip.style, { left: cr.left - sr.left + 'px', top: cr.top - sr.top + 'px', width: cr.width + 'px', height: cr.height + 'px' });
+      Object.assign(c.frame.style, { left: ir.left - cr.left + 'px', top: ir.top - cr.top + 'px' });
+      for (const el of leafClip.querySelectorAll('.leaf-marks')) el.remove();
+      for (const el of s.fr.parentElement.children) { // the highlights (foliate's overlayer svg), so they turn with the page
+        if (el === s.fr) continue;
+        const er = el.getBoundingClientRect();
+        const marks = el.cloneNode(true);
+        marks.classList.add('leaf-marks');
+        Object.assign(marks.style, { position: 'absolute', left: er.left - cr.left + 'px', top: er.top - cr.top + 'px', width: er.width + 'px', height: er.height + 'px', pointerEvents: 'none' });
+        leafClip.append(marks);
+      }
+      const spineLeft = forward !== rtl; // next in a left-to-right book: the sheet turns over the left edge
+      leaf.style.transformOrigin = spineLeft ? 'left center' : 'right center';
+      leaf.classList.add('on');
+      let end;
+      turning = { anim: null, done: new Promise((res) => { end = res; }) };
+      const animated = r.hasAttribute('animated');
+      try {
+        r.removeAttribute('animated');
+        await go();
+      } finally {
+        if (animated) r.setAttribute('animated', '');
+      }
+      const deg = spineLeft ? -100 : 100;
+      const timing = { duration: TURN_MS, easing: 'cubic-bezier(.35, .05, .45, 1)' };
+      const anim = leaf.animate([
+        { transform: 'perspective(1800px) rotateY(0deg)', boxShadow: '0 0 0 rgba(0, 0, 0, 0)' },
+        { transform: `perspective(1800px) rotateY(${deg * 0.4}deg)`, boxShadow: '0 0 28px rgba(0, 0, 0, .28)', offset: 0.45 },
+        { transform: `perspective(1800px) rotateY(${deg}deg)`, boxShadow: '0 0 12px rgba(0, 0, 0, 0)' },
+      ], timing);
+      const shade = leafShade.animate([{ opacity: 0 }, { opacity: 0.18, offset: 0.45 }, { opacity: 0.5 }], timing);
+      leafShade.style.background = `linear-gradient(to ${spineLeft ? 'left' : 'right'}, rgba(0, 0, 0, .45), rgba(0, 0, 0, 0) 70%)`;
+      turning.anim = anim;
+      try { await anim.finished; } catch (_) { /* cancelled */ }
+      shade.cancel();
+      leaf.classList.remove('on');
+      for (const el of leafClip.querySelectorAll('.leaf-marks')) el.remove();
+      turning = null;
+      end();
+      scheduleCopy();
+    }
+
     // ----- taps, keys, selection inside the section iframes -----
     function tap(x) {
       const f = x / window.innerWidth;
       if (cfg.flow === 'scrolled' || (f > 1 / 3 && f < 2 / 3)) return toggleBars();
       hideBars();
-      return f < 0.5 ? view.goLeft() : view.goRight();
+      return turnPage(f < 0.5 ? 'left' : 'right');
     }
 
     function onKey(ev) {
@@ -1078,10 +1193,10 @@
       if (panel || !fnBox.hidden) return;
       if ((k === ' ' || k === 'Enter') && t && t.closest && t.closest('button, a, summary')) return;
       let act = null;
-      if (k === 'ArrowLeft') act = () => view.goLeft();
-      else if (k === 'ArrowRight') act = () => view.goRight();
-      else if (k === 'PageUp' || (k === ' ' && ev.shiftKey)) act = () => view.prev();
-      else if (k === 'PageDown' || k === ' ') act = () => view.next();
+      if (k === 'ArrowLeft') act = () => turnPage('left');
+      else if (k === 'ArrowRight') act = () => turnPage('right');
+      else if (k === 'PageUp' || (k === ' ' && ev.shiftKey)) act = () => turnPage('prev');
+      else if (k === 'PageDown' || k === ' ') act = () => turnPage('next');
       if (!act) return;
       ev.preventDefault();
       hideBars();
@@ -1155,6 +1270,7 @@
 
     // ----- view events -----
     view.addEventListener('relocate', (ev) => {
+      scheduleCopy();
       const loc = ev.detail;
       cur = { cfi: loc.cfi, fraction: loc.fraction };
       const pct = Math.round(loc.fraction * 100);
@@ -1195,7 +1311,9 @@
       id, view, saveSelection,
       destroy() {
         flush();
-        clearTimeout(barsTimer); clearTimeout(backTimer); clearTimeout(saveTimer); clearTimeout(selTimer);
+        clearTimeout(barsTimer); clearTimeout(backTimer); clearTimeout(saveTimer); clearTimeout(selTimer); clearTimeout(copyTimer);
+        if (turning) turning.anim.cancel();
+        dropCopy();
         closeFootnote();
         for (const fn of cleanups) fn();
         try { view.close(); } catch (_) { /* never opened */ }
