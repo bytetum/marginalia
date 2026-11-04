@@ -631,14 +631,18 @@
   // page is hidden). A highlight's anchor is the CFI of the selected range (view.getCFI), drawn with view.addAnnotation.
 
   const READER_KEY = 'marginalia.reader'; // reading settings, per device
-  const DEFAULT_SETTINGS = { flow: 'paginated', theme: 'auto', font: 'publisher', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'publisher', hyphenate: true, turn: 'paper' };
+  const DEFAULT_SETTINGS = { v: 2, flow: 'paginated', theme: 'auto', font: 'book', size: 18, line: 1.5, margin: 'medium', columns: 2, align: 'justify', hyphenate: true, turn: 'paper' };
   const THEMES = { // book page colours; the app chrome follows through #book[data-theme] in app.css
     light: { bg: '#fbfaf7', fg: '#1d1d1b', link: '#1a5fb4' },
     dark: { bg: '#17171a', fg: '#e6e4dc', link: '#7db2f5' },
     sepia: { bg: '#f4ecd8', fg: '#5b4636', link: '#8a4b12' },
   };
   const MARGINS = { narrow: { gap: '3%', margin: '28px' }, medium: { gap: '7%', margin: '48px' }, wide: { gap: '12%', margin: '64px' } };
+  // Literata (SIL OFL, web/vendor/fonts/literata), a typeface made for e-books, with Vietnamese. The section iframes are
+  // blob: documents, so the face is declared in readerCSS with an absolute URL.
+  const FONT_URL = new URL('vendor/fonts/literata/', location.href).href;
   const FONTS = {
+    book: '"Literata", Georgia, serif',
     serif: 'Georgia, "Iowan Old Style", Cambria, "Times New Roman", serif',
     sans: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
   };
@@ -653,12 +657,17 @@
   function loadSettings() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(READER_KEY)) || {}; } catch (_) { /* keep the defaults */ }
-    const s = { ...DEFAULT_SETTINGS, ...saved };
+    if (saved.v !== DEFAULT_SETTINGS.v) { // settings saved before v2 kept the old defaults for font and alignment
+      delete saved.font;
+      delete saved.align;
+    }
+    const s = { ...DEFAULT_SETTINGS, ...saved, v: DEFAULT_SETTINGS.v };
     s.size = Math.min(34, Math.max(12, +s.size || DEFAULT_SETTINGS.size));
     s.line = Math.min(2.2, Math.max(1.1, +s.line || DEFAULT_SETTINGS.line));
     if (!MARGINS[s.margin]) s.margin = DEFAULT_SETTINGS.margin;
     if (s.columns !== 1) s.columns = 2;
     if (!['paper', 'slide', 'none'].includes(s.turn)) s.turn = DEFAULT_SETTINGS.turn;
+    if (!FONTS[s.font] && s.font !== 'publisher') s.font = DEFAULT_SETTINGS.font;
     return s;
   }
 
@@ -718,6 +727,8 @@
     const hyph = c.hyphenate ? 'auto' : 'manual';
     return `
       @namespace epub "http://www.idpf.org/2007/ops";
+      @font-face { font-family: "Literata"; src: url("${FONT_URL}Literata.woff2") format("woff2"); font-weight: 200 900; font-style: normal; font-display: swap; }
+      @font-face { font-family: "Literata"; src: url("${FONT_URL}Literata-Italic.woff2") format("woff2"); font-weight: 200 900; font-style: italic; font-display: swap; }
       html { color-scheme: ${theme === 'dark' ? 'dark' : 'light'}; background: ${t.bg} !important; color: ${t.fg} !important; font-size: ${c.size}px !important; }
       body { background: transparent !important; color: ${t.fg} !important; }
       ${theme === 'light' ? '' : 'body * { color: inherit !important; background-color: transparent !important; }'}
@@ -1002,7 +1013,7 @@
         seg('Layout', 'flow', [['Paginated', 'paginated'], ['Scrolled', 'scrolled']]),
         seg('Page turn', 'turn', [['Paper', 'paper'], ['Slide', 'slide'], ['None', 'none']]),
         seg('Theme', 'theme', [['Auto', 'auto'], ['Light', 'light'], ['Dark', 'dark'], ['Sepia', 'sepia']]),
-        seg('Font', 'font', [['Publisher', 'publisher'], ['Serif', 'serif'], ['Sans', 'sans']]),
+        seg('Font', 'font', [['Literata', 'book'], ['Publisher', 'publisher'], ['Serif', 'serif'], ['Sans', 'sans']]),
         range('Font size', 'size', 12, 34, 1, (v) => v + ' px'),
         range('Line height', 'line', 1.1, 2.2, 0.05, (v) => v.toFixed(2)),
         seg('Margins', 'margin', [['Narrow', 'narrow'], ['Medium', 'medium'], ['Wide', 'wide']]),
@@ -1114,6 +1125,25 @@
     }
     const scheduleCopy = () => { clearTimeout(copyTimer); copyTimer = setTimeout(ensureCopy, 300); };
 
+    // Running header (the chapter) and page number in the page margins, as a printed book has them. foliate makes one
+    // head and foot per column; the styles are inline so that the paper turn's copy of them looks the same.
+    const MARGINAL = { fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', fontSize: '12px', letterSpacing: '.02em', opacity: '.55', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+    function marginals(loc) {
+      const r = view.renderer;
+      if (!r || !r.heads || !r.feet) return;
+      const chapter = loc.tocItem && loc.tocItem.label ? loc.tocItem.label.trim() : '';
+      const l = loc.location;
+      const page = l && l.total ? (l.current + 1) + ' / ' + l.total : '';
+      r.heads.forEach((el, i) => {
+        Object.assign(el.style, MARGINAL, { textAlign: 'start' });
+        el.textContent = i === 0 ? chapter : '';
+      });
+      r.feet.forEach((el, i) => {
+        Object.assign(el.style, MARGINAL, { textAlign: 'end' });
+        el.textContent = i === r.feet.length - 1 ? page : '';
+      });
+    }
+
     async function turnPage(dir) {
       const rtl = view.book && view.book.dir === 'rtl';
       const forward = dir === 'next' || (dir === 'right' && !rtl) || (dir === 'left' && rtl);
@@ -1129,7 +1159,15 @@
       const ir = s.fr.getBoundingClientRect();
       Object.assign(leafClip.style, { left: cr.left - sr.left + 'px', top: cr.top - sr.top + 'px', width: cr.width + 'px', height: cr.height + 'px' });
       Object.assign(c.frame.style, { left: ir.left - cr.left + 'px', top: ir.top - cr.top + 'px' });
-      for (const el of leafClip.querySelectorAll('.leaf-marks')) el.remove();
+      for (const el of leaf.querySelectorAll('.leaf-marks')) el.remove();
+      for (const el of [...(r.heads || []), ...(r.feet || [])]) { // the running header and page number of the old page
+        if (!el.textContent) continue;
+        const er = el.getBoundingClientRect();
+        const m = el.cloneNode(true);
+        m.classList.add('leaf-marks');
+        Object.assign(m.style, { position: 'absolute', left: er.left - sr.left + 'px', top: er.top - sr.top + 'px', width: er.width + 'px', height: er.height + 'px', lineHeight: er.height + 'px' });
+        leaf.insertBefore(m, leafShade);
+      }
       for (const el of s.fr.parentElement.children) { // the highlights (foliate's overlayer svg), so they turn with the page
         if (el === s.fr) continue;
         const er = el.getBoundingClientRect();
@@ -1163,7 +1201,7 @@
       try { await anim.finished; } catch (_) { /* cancelled */ }
       shade.cancel();
       leaf.classList.remove('on');
-      for (const el of leafClip.querySelectorAll('.leaf-marks')) el.remove();
+      for (const el of leaf.querySelectorAll('.leaf-marks')) el.remove();
       turning = null;
       end();
       scheduleCopy();
@@ -1272,6 +1310,7 @@
     view.addEventListener('relocate', (ev) => {
       scheduleCopy();
       const loc = ev.detail;
+      marginals(loc);
       cur = { cfi: loc.cfi, fraction: loc.fraction };
       const pct = Math.round(loc.fraction * 100);
       percentEl.textContent = pct + '%';
