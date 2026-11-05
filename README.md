@@ -376,6 +376,6 @@ journalctl --user -u marginalia-kb-sync -n 5   # "+N articles, +N highlights"
 
 ## License
 
-Marginalia is free software under the GNU Affero General Public License, version 3 or later (`LICENSE`). Bundled
-third-party files keep their own licenses, listed next to them: foliate-js (MIT) and zip.js (BSD-3-Clause) in
+Copyright © 2026 bytetum. All rights reserved: the source is public to read, but no licence is granted to copy,
+modify or redistribute it. Bundled third-party files keep their own licenses, listed next to them: foliate-js (MIT) and zip.js (BSD-3-Clause) in
 `web/vendor/foliate-js/`, Literata (SIL OFL 1.1) in `web/vendor/fonts/literata/`.
